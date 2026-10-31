@@ -24,6 +24,16 @@ module Settings =
     let ytDlpPath =
         configuration.GetValue<string>("yt_dlp:path", "utils/yt-dlp.exe")
 
+    /// YouTube increasingly answers "Sign in to confirm you're not a bot".
+    /// Pointing yt-dlp at a logged-in browser profile fixes it:
+    /// `"chrome"`, `"firefox"`, `"edge"`, or `"chrome:Profile 1"`.
+    let cookiesFromBrowser =
+        configuration.GetValue<string>("yt_dlp:cookies_from_browser", "")
+
+    /// Escape hatch for any other yt-dlp flag, e.g. `--extractor-args ...`.
+    let extraArgs =
+        configuration.GetValue<string>("yt_dlp:extra_args", "")
+
     let workDir =
         configuration.GetValue<string>("work_dir", "work")
 

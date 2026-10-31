@@ -59,6 +59,18 @@ let tryGetString (url: string) : Task<string option> =
             return None
     }
 
+/// GET that reports the HTTP status instead of throwing, so callers can tell
+/// "this video has no captions" (404) from "we are being rate-limited" (429).
+let getStringStatus (url: string) : Task<Result<string, int>> =
+    task {
+        try
+            let! body = getString url
+            return Ok body
+        with
+        | :? HttpRequestException as e when e.StatusCode.HasValue -> return Error(int e.StatusCode.Value)
+        | _ -> return Error -1
+    }
+
 /// GET that returns None instead of throwing (for optional binary lookups).
 let tryGetBytes (url: string) : Task<byte[] option> =
     task {

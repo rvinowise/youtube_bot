@@ -14,11 +14,12 @@ let private usage () =
 scraping — YouTube / Rutube research toolkit
 
 USAGE
-  scraping scan           [options]        long-running scan into PostgreSQL
+  scraping scan           [options]        endless BFS over the recommendation graph
+  scraping topics                         list topics with queue and hit counts
   scraping db                             check the database and apply the schema
   scraping videos [--state S] [--term T]  list videos with URLs and transcript size
-  scraping hits [--term T] [--limit N]    pre-computed seed-term mentions with timestamps
-  scraping backfill                       recompute hits for transcripts that have none
+  scraping hits [--topic T] [--term X]    pre-computed term mentions with timestamps
+  scraping backfill --topic T             recompute hits for transcripts that have none
   scraping sql --query "select ..."       run arbitrary SQL, print a table
   scraping find --term "бессмертие"       search the collected transcripts
   scraping find-bloggers  [options]
@@ -29,10 +30,13 @@ USAGE
   scraping verify         --channel <UC...>
 
 SCAN OPTIONS
-  --queries "a,b,c"     comma separated search queries
-  --pages N             search continuation pages per query (default 3)
-  --limit N             stop after N videos in the caption stage (0 = all)
-  --delay N             pause between items, ms (default 300)
+  --topic NAME          topic name, e.g. "immortality" (required)
+  --stems "a,b+c,d"     terms; `+` means all stems in the same segment
+                        (default: the built-in immortality vocabulary)
+  --seed-video ID[,ID]  starting video(s); repeatable, idempotent
+  --related N           recommendations taken per video (default 20)
+  --delay N             pause between videos, ms (default 300)
+  --limit N             stop after N expanded videos (0 = never, default)
 
 FIND-BLOGGERS OPTIONS
   --queries "a,b,c"     comma separated search queries
@@ -243,40 +247,72 @@ let private verify (args: string list) : Task<int> =
 
 // ---------------------------------------------------------------- scan / db
 
-let private backfillCommand (_args: string list) : Task<int> =
+let private backfillCommand (args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
-        let rows = Db.transcriptsWithoutHits ()
-        Console.WriteLine(sprintf "transcripts without hits: %d" rows.Length)
+        let topicName = valueOf args "--topic" ""
 
-        let mutable total = 0
+        if topicName = "" then
+            Console.WriteLine "missing --topic"
+            return 1
+        else
+            let topicId = Db.ensureTopic topicName []
+            let stems = Db.topicStems topicId
+            let rows = Db.transcriptsWithoutHits topicId
+            Console.WriteLine(sprintf "topic %s: transcripts without hits: %d" topicName rows.Length)
 
-        for t in rows do
-            let hits = Scan.hitsFromText t.text
-            Db.insertHits t.video_id hits
-            total <- total + hits.Length
+            let mutable total = 0
 
-        Console.WriteLine(sprintf "inserted hits: %d" total)
-        return 0
+            for t in rows do
+                let hits = Scan.hitsFromText stems t.text
+                Db.insertHits topicId t.video_id hits
+                total <- total + hits.Length
+
+            Console.WriteLine(sprintf "inserted hits: %d" total)
+            return 0
     }
 
 let private hitsCommand (args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
+        let topic = valueOf args "--topic" ""
         let term = valueOf args "--term" ""
         let limit = intOf args "--limit" 100
-        let rows = Db.listHits term limit
+        let rows = Db.listHits topic term limit
 
         Console.WriteLine(sprintf "hits: %d" rows.Length)
 
         printTable
-            [ "url"; "at"; "term"; "title"; "snippet" ]
+            [ "url"; "at"; "d"; "term"; "title"; "snippet" ]
             [ for r in rows ->
                   [ sprintf "https://www.youtube.com/watch?v=%s&t=%ds" r.video_id (r.t_start / 1000)
                     sprintf "%d:%02d" (r.t_start / 60000) (r.t_start / 1000 % 60)
+                    string r.depth
                     r.term
                     r.title
                     r.snippet ] ]
+
+        return 0
+    }
+
+let private topicsCommand (_args: string list) : Task<int> =
+    task {
+        Db.init Settings.connectionString
+        Db.migrate ()
+        let rows = Db.listTopics ()
+
+        Console.WriteLine(sprintf "topics: %d" rows.Length)
+
+        printTable
+            [ "id"; "name"; "queued"; "expanded"; "videos"; "hits"; "terms" ]
+            [ for r in rows ->
+                  [ string r.id
+                    r.name
+                    string r.queued
+                    string r.expanded
+                    string r.videos
+                    string r.hits
+                    r.stems ] ]
 
         return 0
     }
@@ -342,34 +378,59 @@ let private dbCommand (_args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
         Db.migrate ()
-        let queries, videos, transcripts = Db.stats ()
+        let topics, frontier, videos, transcripts, hits = Db.stats ()
         Console.WriteLine "connection:  ok"
-        Console.WriteLine(sprintf "queries:     %d" queries.Length)
-        Console.WriteLine(sprintf "videos:      %d" videos.Length)
-        Console.WriteLine(sprintf "transcripts: %d" transcripts.Length)
+        Console.WriteLine(sprintf "topics:      %d" topics)
+        Console.WriteLine(sprintf "frontier:    %d" frontier)
+        Console.WriteLine(sprintf "videos:      %d" videos)
+        Console.WriteLine(sprintf "transcripts: %d" transcripts)
+        Console.WriteLine(sprintf "hits:        %d" hits)
         return 0
     }
+
+let private splitCsv (s: string) =
+    s.Split(',')
+    |> Array.map (fun x -> x.Trim())
+    |> Array.filter (String.IsNullOrWhiteSpace >> not)
+    |> List.ofArray
 
 let private scanCommand (args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
         Db.migrate ()
 
-        let queries =
-            (valueOf args "--queries" (String.concat "," BloggerFinder.defaultQueries)).Split(',')
-            |> Array.map (fun s -> s.Trim())
-            |> Array.filter (String.IsNullOrWhiteSpace >> not)
-            |> List.ofArray
+        let topic = valueOf args "--topic" ""
 
-        let options =
-            { Queries = queries
-              MaxPages = intOf args "--pages" 3
-              Limit = intOf args "--limit" 0
-              DelayMs = intOf args "--delay" 300 }
+        if topic = "" then
+            Console.WriteLine "missing --topic"
+            return 1
+        else
+            let stems =
+                match valueOf args "--stems" "" with
+                | "" -> HitTerms.defaultStems
+                | s -> splitCsv s
 
-        Console.WriteLine(sprintf "queries: %d | pages: %d | limit: %d" options.Queries.Length options.MaxPages options.Limit)
-        do! Scan.run options
-        return 0
+            let seeds = splitCsv (valueOf args "--seed-video" "")
+
+            let options =
+                { Topic = topic
+                  Stems = stems
+                  SeedVideos = seeds
+                  RelatedLimit = intOf args "--related" 20
+                  DelayMs = intOf args "--delay" 300
+                  Limit = intOf args "--limit" 0 }
+
+            Console.WriteLine(
+                sprintf
+                    "topic: %s | terms: %d | seeds: %d | related/video: %d"
+                    options.Topic
+                    options.Stems.Length
+                    options.SeedVideos.Length
+                    options.RelatedLimit
+            )
+
+            do! Scan.run options
+            return 0
     }
 
 // ---------------------------------------------------------------- entry point
@@ -388,6 +449,7 @@ let main argv =
     let work =
         match command with
         | "scan" -> scanCommand rest
+        | "topics" -> topicsCommand rest
         | "db" -> dbCommand rest
         | "videos" -> videosCommand rest
         | "hits" -> hitsCommand rest

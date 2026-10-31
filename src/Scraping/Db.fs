@@ -7,37 +7,37 @@ open Dapper
 // ---------------------------------------------------------------- schema
 // Same convention as twitter_bot: a class per table whose ToString() is the
 // table name and whose members are the column names, plus a [<CLIMutable>]
-// record per row. Dapper.FSharp reads the names off these.
+// record per row.
 
-type Query_table() =
-    override _.ToString() = "query"
-    member _.id = "id"
-    member _.text = "text"
-    member _.state = "state"
-    member _.results = "results"
-
-[<CLIMutable>]
-type Query_row =
-    { id: int64
-      text: string
-      state: string
-      results: int }
-
-type Channel_table() =
-    override _.ToString() = "channel"
+type Topic_table() =
+    override _.ToString() = "topic"
     member _.id = "id"
     member _.name = "name"
-    member _.subs = "subs"
-    member _.videos = "videos"
-    member _.state = "state"
+    member _.stems = "stems"
 
 [<CLIMutable>]
-type Channel_row =
-    { id: string
+type Topic_row =
+    { id: int64
       name: string
-      subs: int
-      videos: int
-      state: string }
+      stems: string[] }
+
+type Frontier_table() =
+    override _.ToString() = "frontier"
+    member _.topic_id = "topic_id"
+    member _.video_id = "video_id"
+    member _.depth = "depth"
+    member _.parent_id = "parent_id"
+    member _.state = "state"
+    member _.attempts = "attempts"
+
+[<CLIMutable>]
+type Frontier_row =
+    { topic_id: int64
+      video_id: string
+      depth: int
+      parent_id: string
+      state: string
+      attempts: int }
 
 type Video_table() =
     override _.ToString() = "video"
@@ -50,6 +50,9 @@ type Video_table() =
     member _.attempts = "attempts"
     member _.last_error = "last_error"
     member _.has_captions = "has_captions"
+    member _.depth = "depth"
+    member _.parent_id = "parent_id"
+    member _.discovered_via = "discovered_via"
 
 [<CLIMutable>]
 type Video_row =
@@ -61,7 +64,10 @@ type Video_row =
       state: string
       attempts: int
       last_error: string
-      has_captions: bool }
+      has_captions: bool
+      depth: int
+      parent_id: string
+      discovered_via: string }
 
 type Transcript_table() =
     override _.ToString() = "transcript"
@@ -81,7 +87,7 @@ type Transcript_row =
 
 type Hit_table() =
     override _.ToString() = "hit"
-    member _.id = "id"
+    member _.topic_id = "topic_id"
     member _.video_id = "video_id"
     member _.term = "term"
     member _.snippet = "snippet"
@@ -90,7 +96,7 @@ type Hit_table() =
 
 [<CLIMutable>]
 type Hit_row =
-    { id: int64
+    { topic_id: int64
       video_id: string
       term: string
       snippet: string
@@ -106,46 +112,52 @@ module Db =
     let init (connectionString: string) =
         if String.IsNullOrWhiteSpace connectionString then
             failwith "database:connection_string is empty — check appsettings.json"
+
         dataSource <- NpgsqlDataSource.Create connectionString
 
     let openConnection () : NpgsqlConnection = dataSource.OpenConnection()
 
     let private ddl =
         """
-create table if not exists query (
-    id          bigserial primary key,
-    text        text not null unique,
-    state       text not null default 'pending',
-    results     int  not null default 0,
-    attempts    int  not null default 0,
-    created_at  timestamptz not null default now(),
-    updated_at  timestamptz not null default now()
+create table if not exists topic (
+    id         bigserial primary key,
+    name       text not null unique,
+    stems      text[] not null,
+    created_at timestamptz not null default now()
 );
 
--- older databases predate the attempts column
-alter table query add column if not exists attempts int not null default 0;
-
-create table if not exists channel (
-    id          text primary key,
-    name        text not null default '',
-    subs        int  not null default 0,
-    videos      int  not null default 0,
-    state       text not null default 'pending',
-    updated_at  timestamptz not null default now()
+create table if not exists frontier (
+    topic_id  bigint not null references topic(id) on delete cascade,
+    video_id  text not null,
+    depth     int  not null default 0,
+    parent_id text null,
+    state     text not null default 'queued',
+    attempts  int  not null default 0,
+    added_at  timestamptz not null default now(),
+    primary key (topic_id, video_id)
 );
+
+create index if not exists frontier_queue_idx on frontier (topic_id, state, depth, added_at);
 
 create table if not exists video (
-    id           text primary key,
-    channel_id   text not null default '',
-    title        text not null default '',
-    duration     int  not null default 0,
-    published    timestamptz null,
-    state        text not null default 'pending',
-    attempts     int  not null default 0,
-    last_error   text null,
-    has_captions boolean not null default false,
-    updated_at   timestamptz not null default now()
+    id             text primary key,
+    channel_id     text not null default '',
+    title          text not null default '',
+    duration       int  not null default 0,
+    published      timestamptz null,
+    state          text not null default 'pending',
+    attempts       int  not null default 0,
+    last_error     text null,
+    has_captions   boolean not null default false,
+    depth          int  not null default 0,
+    parent_id      text null,
+    discovered_via text not null default 'seed',
+    updated_at     timestamptz not null default now()
 );
+
+alter table video add column if not exists depth          int  not null default 0;
+alter table video add column if not exists parent_id      text null;
+alter table video add column if not exists discovered_via text not null default 'seed';
 
 create index if not exists video_state_idx   on video (state);
 create index if not exists video_channel_idx on video (channel_id);
@@ -159,17 +171,28 @@ create table if not exists transcript (
     fetched_at timestamptz not null default now()
 );
 
+-- v0.1 had a topic-less hit table; it is derived data, so drop and recreate.
+do $$
+begin
+    if exists (
+        select 1 from information_schema.columns
+        where table_name = 'hit' and column_name = 'id'
+    ) then
+        drop table hit;
+    end if;
+end $$;
+
 create table if not exists hit (
-    id        bigserial primary key,
-    video_id  text not null references video(id) on delete cascade,
-    term      text not null,
-    snippet   text not null default '',
-    t_start   int  not null default 0,
-    score     real not null default 0,
-    unique (video_id, term, t_start)
+    topic_id bigint not null references topic(id) on delete cascade,
+    video_id text   not null references video(id) on delete cascade,
+    term     text   not null,
+    snippet  text   not null default '',
+    t_start  int    not null default 0,
+    score    real   not null default 0,
+    unique (topic_id, video_id, term, t_start)
 );
 
-create index if not exists hit_video_idx on hit (video_id);
+create index if not exists hit_topic_idx on hit (topic_id, term);
 """
 
     /// Idempotent DDL. Safe to call on every start.
@@ -177,81 +200,293 @@ create index if not exists hit_video_idx on hit (video_id);
         use conn = openConnection()
         conn.Execute(ddl) |> ignore
 
-    /// Transcripts that were stored before the `hit` table existed (or before
-    /// the seed vocabulary changed) and therefore have no pre-computed hits.
-    let transcriptsWithoutHits () =
+    // ------------------------------------------------------------ topics
+
+    /// Create the topic if missing, return its id. Stems are only written on
+    /// creation, so an existing topic keeps its vocabulary.
+    let ensureTopic (name: string) (stems: string list) : int64 =
         use conn = openConnection()
 
-        conn.Query<Transcript_row>(
+        conn.Execute(
+            "insert into topic (name, stems) values (@name, @stems) on conflict (name) do nothing",
+            {| name = name; stems = List.toArray stems |}
+        )
+        |> ignore
+
+        conn.ExecuteScalar<int64>("select id from topic where name = @name", {| name = name |})
+
+    let topicStems (topicId: int64) : string list =
+        use conn = openConnection()
+
+        conn.ExecuteScalar<string[]>("select stems from topic where id = @id", {| id = topicId |})
+        |> List.ofArray
+
+    type TopicStat =
+        { id: int64
+          name: string
+          stems: string
+          queued: int64
+          expanded: int64
+          videos: int64
+          hits: int64 }
+
+    let listTopics () =
+        use conn = openConnection()
+
+        conn.Query<TopicStat>(
             """
-select t.video_id, t.lang, t.source, t.text, t.chars
-from transcript t
-where not exists (select 1 from hit h where h.video_id = t.video_id)
+select t.id,
+       t.name,
+       array_to_string(t.stems, ', ') as stems,
+       (select count(*) from frontier f where f.topic_id = t.id and f.state = 'queued')   as queued,
+       (select count(*) from frontier f where f.topic_id = t.id and f.state = 'expanded') as expanded,
+       (select count(*) from video v
+          join frontier f2 on f2.video_id = v.id and f2.topic_id = t.id
+         where v.state = 'done')                                                          as videos,
+       (select count(*) from hit h where h.topic_id = t.id)                               as hits
+from topic t
+order by t.id
 """
         )
         |> Seq.toList
 
-    type HitListRow =
-        { video_id: string
-          title: string
-          term: string
-          t_start: int
-          snippet: string }
+    // ------------------------------------------------------------ frontier
 
-    /// Pre-computed seed-term matches, with the timestamp of the first mention.
-    let listHits (term: string) (limit: int) =
+    /// Crash recovery: anything left `running` goes back to the queue.
+    let resetRunning (topicId: int64) =
         use conn = openConnection()
 
-        conn.Query<HitListRow>(
-            """
-select h.video_id, v.title, h.term, h.t_start, h.snippet
-from hit h
-join video v on v.id = h.video_id
-where (@term = '' or h.term = @term)
-order by h.term, h.t_start
-limit @limit
-""",
-            {| term = term; limit = limit |}
+        conn.Execute(
+            "update frontier set state = 'queued' where topic_id = @topic and state = 'running'",
+            {| topic = topicId |}
         )
-        |> Seq.toList
+        |> ignore
 
-    /// Replace the hits of one video (idempotent per (video, term, t_start)).
-    let insertHits (videoId: string) (hits: (string * string * int) list) =
+    /// Add a video to the topic's queue. Idempotent.
+    let enqueue (topicId: int64) (videoId: string) (depth: int) (parentId: string) (via: string) =
+        use conn = openConnection()
+
+        conn.Execute(
+            """
+insert into video (id, depth, parent_id, discovered_via)
+values (@id, @depth, @parent, @via)
+on conflict (id) do nothing
+""",
+            {| id = videoId
+               depth = depth
+               parent = (if isNull parentId then null else box parentId)
+               via = via |}
+        )
+        |> ignore
+
+        conn.Execute(
+            """
+insert into frontier (topic_id, video_id, depth, parent_id)
+values (@topic, @video, @depth, @parent)
+on conflict (topic_id, video_id) do nothing
+""",
+            {| topic = topicId
+               video = videoId
+               depth = depth
+               parent = (if isNull parentId then null else box parentId) |}
+        )
+        |> ignore
+
+    /// Take the shallowest queued item and mark it `running`.
+    let claimFrontier (topicId: int64) : Frontier_row =
+        use conn = openConnection()
+
+        conn.QuerySingleOrDefault<Frontier_row>(
+            """
+update frontier set state = 'running', attempts = attempts + 1
+where (topic_id, video_id) = (
+    select topic_id, video_id
+    from frontier
+    where topic_id = @topic and state = 'queued'
+    order by depth, added_at
+    limit 1
+    for update skip locked
+)
+returning topic_id, video_id, depth, parent_id, state, attempts
+""",
+            {| topic = topicId |}
+        )
+
+    let markExpanded (topicId: int64) (videoId: string) =
+        use conn = openConnection()
+
+        conn.Execute(
+            "update frontier set state = 'expanded' where topic_id = @topic and video_id = @video",
+            {| topic = topicId; video = videoId |}
+        )
+        |> ignore
+
+    /// After a failure: retry up to 3 times, then give up.
+    let markFrontierRetry (topicId: int64) (videoId: string) (attempts: int) =
+        use conn = openConnection()
+
+        let state = if attempts >= 3 then "failed" else "queued"
+
+        conn.Execute(
+            "update frontier set state = @state where topic_id = @topic and video_id = @video",
+            {| state = state
+               topic = topicId
+               video = videoId |}
+        )
+        |> ignore
+
+    let markFrontierFailed (topicId: int64) (videoId: string) =
+        use conn = openConnection()
+
+        conn.Execute(
+            "update frontier set state = 'failed' where topic_id = @topic and video_id = @video",
+            {| topic = topicId; video = videoId |}
+        )
+        |> ignore
+
+    let queuedCount (topicId: int64) : int =
+        use conn = openConnection()
+
+        conn.ExecuteScalar<int64>(
+            "select count(*) from frontier where topic_id = @topic and state = 'queued'",
+            {| topic = topicId |}
+        )
+        |> int
+
+    // ------------------------------------------------------------ video / transcript
+
+    let getTranscript (videoId: string) : Transcript_row =
+        use conn = openConnection()
+
+        conn.QuerySingleOrDefault<Transcript_row>(
+            "select video_id, lang, source, text, chars from transcript where video_id = @id",
+            {| id = videoId |}
+        )
+
+    let saveTranscript (videoId: string) (text: string) =
+        use conn = openConnection()
+
+        conn.Execute(
+            """
+insert into transcript (video_id, lang, source, text, chars)
+values (@video_id, 'ru', 'captions', @text, @chars)
+on conflict (video_id) do update
+set text = excluded.text, chars = excluded.chars, fetched_at = now()
+""",
+            {| video_id = videoId
+               text = text
+               chars = text.Length |}
+        )
+        |> ignore
+
+    let markVideoDone (videoId: string) (duration: int) (published: Nullable<DateTime>) =
+        use conn = openConnection()
+
+        conn.Execute(
+            """
+update video set state = 'done', has_captions = true, attempts = attempts + 1,
+       last_error = null, duration = @duration, published = @published, updated_at = now()
+where id = @id
+""",
+            {| duration = duration
+               published = published
+               id = videoId |}
+        )
+        |> ignore
+
+    let markVideoNoCaptions (videoId: string) (reason: string) (duration: int) =
+        use conn = openConnection()
+
+        conn.Execute(
+            """
+update video set state = 'no_captions', has_captions = false, attempts = attempts + 1,
+       last_error = @err, duration = @duration, updated_at = now()
+where id = @id
+""",
+            {| err = reason
+               duration = duration
+               id = videoId |}
+        )
+        |> ignore
+
+    let markVideoFailed (videoId: string) (reason: string) =
+        use conn = openConnection()
+
+        conn.Execute(
+            """
+update video set state = 'failed', attempts = attempts + 1, last_error = @err, updated_at = now()
+where id = @id
+""",
+            {| err = reason; id = videoId |}
+        )
+        |> ignore
+
+    // ------------------------------------------------------------ hits
+
+    /// Insert the hits of one video for one topic. Idempotent.
+    let insertHits (topicId: int64) (videoId: string) (hits: (string * string * int) list) =
         if not hits.IsEmpty then
             use conn = openConnection()
 
             for (term, snippet, startMs) in hits do
                 conn.Execute(
                     """
-insert into hit (video_id, term, snippet, t_start, score)
-values (@video_id, @term, @snippet, @t_start, 1)
-on conflict (video_id, term, t_start) do nothing
+insert into hit (topic_id, video_id, term, snippet, t_start, score)
+values (@topic, @video, @term, @snippet, @t_start, 1)
+on conflict (topic_id, video_id, term, t_start) do nothing
 """,
-                    {| video_id = videoId
+                    {| topic = topicId
+                       video = videoId
                        term = term
                        snippet = snippet
                        t_start = startMs |}
                 )
                 |> ignore
 
+    type HitListRow =
+        { video_id: string
+          title: string
+          term: string
+          t_start: int
+          snippet: string
+          depth: int }
+
+    let listHits (topicName: string) (term: string) (limit: int) =
+        use conn = openConnection()
+
+        conn.Query<HitListRow>(
+            """
+select h.video_id, v.title, h.term, h.t_start, h.snippet, v.depth
+from hit h
+join video v on v.id = h.video_id
+join topic t on t.id = h.topic_id
+where (@topic = '' or t.name = @topic)
+  and (@term = '' or h.term = @term)
+order by v.depth, h.t_start
+limit @limit
+""",
+            {| topic = topicName; term = term; limit = limit |}
+        )
+        |> Seq.toList
+
+    // ------------------------------------------------------------ browsing
+
     type VideoListRow =
         { id: string
           title: string
           state: string
           duration: int
-          chars: int }
+          chars: int
+          depth: int
+          discovered_via: string }
 
-    /// Videos with their transcript size, newest first.
     let listVideos (state: string) (term: string) (limit: int) =
         use conn = openConnection()
 
         conn.Query<VideoListRow>(
             """
-select v.id,
-       v.title,
-       v.state,
-       v.duration,
-       coalesce(t.chars, 0) as chars
+select v.id, v.title, v.state, v.duration, coalesce(t.chars, 0) as chars,
+       v.depth, v.discovered_via
 from video v
 left join transcript t on t.video_id = v.id
 where (@state = '' or v.state = @state)
@@ -266,29 +501,11 @@ limit @limit
         )
         |> Seq.toList
 
-    /// Run arbitrary SQL and return (headers, rows) for a generic table dump.
-    let runSql (sql: string) =
-        use conn = openConnection()
-        use cmd = new NpgsqlCommand(sql, conn)
-        use reader = cmd.ExecuteReader()
-
-        let headers = [ for i in 0 .. reader.FieldCount - 1 -> reader.GetName i ]
-
-        let rows =
-            [ while reader.Read() do
-                  yield
-                      [ for i in 0 .. reader.FieldCount - 1 ->
-                            if reader.IsDBNull i then "" else string (reader.GetValue i) ] ]
-
-        headers, rows
-
     type TranscriptHit =
         { video_id: string
           title: string
           snippet: string }
 
-    /// Full-text-ish search over the spoken text. Returns a snippet around the
-    /// first occurrence so the caller can judge the context.
     let searchTranscripts (term: string) (limit: int) =
         use conn = openConnection()
 
@@ -309,12 +526,43 @@ limit @limit
         )
         |> Seq.toList
 
+    /// Transcripts of this topic that have no hits yet (for `backfill`).
+    let transcriptsWithoutHits (topicId: int64) =
+        use conn = openConnection()
+
+        conn.Query<Transcript_row>(
+            """
+select t.video_id, t.lang, t.source, t.text, t.chars
+from transcript t
+join frontier f on f.video_id = t.video_id and f.topic_id = @topic
+where not exists (select 1 from hit h where h.video_id = t.video_id and h.topic_id = @topic)
+""",
+            {| topic = topicId |}
+        )
+        |> Seq.toList
+
+    /// Run arbitrary SQL and return (headers, rows) for a generic table dump.
+    let runSql (sql: string) =
+        use conn = openConnection()
+        use cmd = new NpgsqlCommand(sql, conn)
+        use reader = cmd.ExecuteReader()
+
+        let headers = [ for i in 0 .. reader.FieldCount - 1 -> reader.GetName i ]
+
+        let rows =
+            [ while reader.Read() do
+                  yield
+                      [ for i in 0 .. reader.FieldCount - 1 ->
+                            if reader.IsDBNull i then "" else string (reader.GetValue i) ] ]
+
+        headers, rows
+
     let stats () =
         use conn = openConnection()
-        conn.Query<Query_row>("select id, text, state, results from query order by id") |> Seq.toList,
-        conn.Query<Video_row>(
-            "select id, channel_id, title, duration, published, state, attempts, last_error, has_captions from video"
-        )
-        |> Seq.toList,
-        conn.Query<Transcript_row>("select video_id, lang, source, text, chars from transcript")
-        |> Seq.toList
+
+        let scalar (sql: string) = conn.ExecuteScalar<int64>(sql) |> int
+        scalar "select count(*) from topic",
+        scalar "select count(*) from frontier",
+        scalar "select count(*) from video",
+        scalar "select count(*) from transcript",
+        scalar "select count(*) from hit"

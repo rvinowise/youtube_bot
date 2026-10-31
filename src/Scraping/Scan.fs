@@ -5,21 +5,24 @@ open System.Globalization
 open System.IO
 open System.Text.Json
 open System.Threading.Tasks
-open Dapper
 open Serilog
 
 type ScanOptions =
-    { Queries: string list
-      MaxPages: int
-      Limit: int
-      DelayMs: int }
+    { Topic: string
+      Stems: string list
+      SeedVideos: string list
+      RelatedLimit: int
+      DelayMs: int
+      /// Stop after N expanded videos. 0 = run until the frontier is empty
+      /// (which, with a live recommendation graph, means "until you kill it").
+      Limit: int }
 
 /// Live counters for the progress line and the heartbeat file.
 type Counters =
-    { mutable QueriesDone: int
-      mutable QueriesTotal: int
-      mutable VideosFound: int
-      mutable VideosNew: int
+    { mutable Topic: string
+      mutable Depth: int
+      mutable Expanded: int
+      mutable Queued: int
       mutable Captions: int
       mutable NoCaptions: int
       mutable Hits: int
@@ -27,15 +30,19 @@ type Counters =
       mutable Current: string
       mutable StartedAt: DateTime }
 
-/// Long-running scan: query -> video -> transcript, all state in PostgreSQL so
-/// the process can be killed at any moment and resumed with the same command.
+/// Endless breadth-first walk over YouTube's recommendation graph.
+///
+/// The queue lives in PostgreSQL (`frontier`, one per topic), so the process can
+/// be killed at any moment and resumed with the same command: it picks up the
+/// shallowest queued video and keeps going. There is no depth limit — you stop
+/// it yourself.
 module Scan =
 
     let private counters =
-        { QueriesDone = 0
-          QueriesTotal = 0
-          VideosFound = 0
-          VideosNew = 0
+        { Topic = ""
+          Depth = 0
+          Expanded = 0
+          Queued = 0
           Captions = 0
           NoCaptions = 0
           Hits = 0
@@ -48,16 +55,16 @@ module Scan =
     let private render () =
         let c = counters
         let elapsed = max 0.001 (DateTime.UtcNow - c.StartedAt).TotalSeconds
-        let rate = float c.Captions / elapsed
+        let rate = float c.Expanded / elapsed
 
         let line =
             sprintf
-                "[%s] q %d/%d | found %d | new %d | caps %d | nocaps %d | hits %d | fail %d | %.1f/s | now: %s"
+                "[%s] %s | depth %d | expanded %d | queued %d | caps %d | nocaps %d | hits %d | fail %d | %.2f/s | now: %s"
                 (DateTime.Now.ToString "HH:mm:ss")
-                c.QueriesDone
-                c.QueriesTotal
-                c.VideosFound
-                c.VideosNew
+                c.Topic
+                c.Depth
+                c.Expanded
+                c.Queued
                 c.Captions
                 c.NoCaptions
                 c.Hits
@@ -65,7 +72,7 @@ module Scan =
                 rate
                 c.Current
 
-        Console.Write("\r" + line.PadRight(160))
+        Console.Write("\r" + line.PadRight(170))
 
     let private heartbeat () =
         try
@@ -75,15 +82,15 @@ module Scan =
             let payload =
                 {| ts = DateTime.UtcNow.ToString "o"
                    pid = Environment.ProcessId
-                   queries_done = c.QueriesDone
-                   queries_total = c.QueriesTotal
-                   videos_found = c.VideosFound
-                   videos_new = c.VideosNew
+                   topic = c.Topic
+                   depth = c.Depth
+                   expanded = c.Expanded
+                   queued = c.Queued
                    captions = c.Captions
                    no_captions = c.NoCaptions
                    hits = c.Hits
                    failed = c.Failed
-                   rate = Math.Round(float c.Captions / elapsed, 2)
+                   rate = Math.Round(float c.Expanded / elapsed, 2)
                    current = c.Current |}
 
             Directory.CreateDirectory Settings.workDir |> ignore
@@ -91,252 +98,132 @@ module Scan =
         with e ->
             Log.Warning(e, "heartbeat failed")
 
-    // ------------------------------------------------------------ queue
+    // ------------------------------------------------------------ hits
 
-    /// Claims a pending query, or retries a failed one that still has attempts
-    /// left. `attempts` is bumped at claim time, so a crash mid-query also
-    /// counts as an attempt.
-    let private claimQuery (conn: Npgsql.NpgsqlConnection) =
-        conn.QuerySingleOrDefault<Query_row>(
-            """
-update query set state = 'running', attempts = attempts + 1, updated_at = now()
-where id = (
-    select id from query
-    where state = 'pending' or (state = 'failed' and attempts < 3)
-    order by id limit 1 for update skip locked
-)
-returning id, text, state, results
-"""
-        )
+    let private hitsFromSegments (stems: string list) (segments: TranscriptSegment list) =
+        [ for term in stems do
+              match
+                  segments
+                  |> List.tryFind (fun s -> HitTerms.matches (s.Text.ToLowerInvariant()) term)
+              with
+              | Some seg ->
+                  let low = seg.Text.ToLowerInvariant()
+                  let idx = HitTerms.firstIndex low term
+                  let start = max 0 (idx - 80)
+                  let len = min (seg.Text.Length - start) 220
+                  yield term, seg.Text.Substring(start, len), seg.StartMs
+              | None -> () ]
 
-    let private claimVideo (conn: Npgsql.NpgsqlConnection) =
-        conn.QuerySingleOrDefault<Video_row>(
-            """
-update video set state = 'running', updated_at = now()
-where id = (
-    select id from video where state = 'pending' order by updated_at limit 1 for update skip locked
-)
-returning id, channel_id, title, duration, published, state, attempts, last_error, has_captions
-"""
-        )
+    /// Same, but over a flat transcript where timestamps are gone.
+    let hitsFromText (stems: string list) (text: string) =
+        let low = text.ToLowerInvariant()
+
+        [ for term in stems do
+              if HitTerms.matches low term then
+                  let idx = HitTerms.firstIndex low term
+                  let start = max 0 (idx - 80)
+                  let len = min (text.Length - start) 220
+                  yield term, text.Substring(start, len), 0 ]
+
+    // ------------------------------------------------------------ one video
 
     let private parseUploadDate (s: string) =
         match DateTime.TryParseExact(s, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None) with
         | true, d -> Nullable d
         | _ -> Nullable()
 
-    // ------------------------------------------------------------ stages
-
-    let private enqueueQueries (queries: string list) =
-        use conn = Db.openConnection()
-
-        for q in queries do
-            conn.Execute(
-                "insert into query (text) values (@text) on conflict (text) do nothing",
-                {| text = q |}
-            )
-            |> ignore
-
-        counters.QueriesTotal <-
-            conn.ExecuteScalar<int64>("select count(*) from query where state = 'pending'") |> int
-
-    let private runSearchStage (options: ScanOptions) =
+    /// Fetch the transcript unless another topic already did.
+    /// `Ok None` means "already had it, no segments available".
+    let private ensureTranscript
+        (exe: string)
+        (videoId: string)
+        : Task<Result<TranscriptSegment list option, TranscriptError>> =
         task {
-            let mutable go = true
+            let existing = Db.getTranscript videoId
 
-            while go do
-                use conn = Db.openConnection()
-                let q = claimQuery conn
+            if not (isNull (box existing)) then
+                return Ok None
+            else
+                let! meta = YtDlp.fetchMeta exe videoId
 
-                if isNull (box q) then
-                    go <- false
-                else
-                    counters.Current <- sprintf "search: %s" q.text
-                    render ()
+                match meta with
+                | Error reason when YtDlp.isPermanentError reason ->
+                    // gone / private / age-gated: retrying will never help
+                    Db.markVideoFailed videoId reason
+                    return Error(NoCaptions reason)
+                | Error reason ->
+                    // bot check, 429, network: leave the row alone and let the
+                    // frontier retry it later
+                    return Error(Transient reason)
+                | Ok m ->
+                    let! transcript = Transcript.fetch m.Captions
 
-                    try
-                        let! found = YouTube.search q.text options.MaxPages
-                        counters.VideosFound <- counters.VideosFound + found.Length
-
-                        let mutable added = 0
-
-                        for v in found do
-                            let n =
-                                conn.Execute(
-                                    """
-insert into video (id, channel_id, title, duration, published, state)
-values (@id, @channel_id, @title, 0, null, 'pending')
-on conflict (id) do nothing
-""",
-                                    {| id = v.Id
-                                       channel_id = v.ChannelId
-                                       title = v.Title |}
-                                )
-
-                            added <- added + n
-
-                        counters.VideosNew <- counters.VideosNew + added
-
-                        conn.Execute(
-                            "update query set state = 'done', results = @n, updated_at = now() where id = @id",
-                            {| n = found.Length; id = q.id |}
-                        )
-                        |> ignore
-
-                        Log.Information(
-                            "query done: {Query} -> {Found} found, {Added} new",
-                            q.text,
-                            found.Length,
-                            added
-                        )
-                    with e ->
-                        Log.Error(e, "query failed: {Query}", q.text)
-
-                        conn.Execute(
-                            """
-update query set
-    state = case when attempts >= 3 then 'failed' else 'pending' end,
-    updated_at = now()
-where id = @id
-""",
-                            {| id = q.id |}
-                        )
-                        |> ignore
-
-                    counters.QueriesDone <- counters.QueriesDone + 1
-                    render ()
-                    heartbeat ()
-                    do! Http.delay options.DelayMs
+                    match transcript with
+                    | Ok segments ->
+                        Db.saveTranscript videoId (Transcript.toText segments)
+                        Db.markVideoDone videoId m.Duration (parseUploadDate m.UploadDate)
+                        return Ok(Some segments)
+                    | Error(NoCaptions reason) ->
+                        Db.markVideoNoCaptions videoId reason m.Duration
+                        return Error(NoCaptions reason)
+                    | Error(Transient reason) -> return Error(Transient reason)
         }
 
-    /// Position of the first stem that is actually present.
-    let private firstIndex (low: string) (stems: string list) =
-        stems |> List.map low.IndexOf |> List.filter (fun i -> i >= 0) |> List.min
-
-    /// First mention of each seed term, with a snippet and the timestamp.
-    let private findHits (segments: TranscriptSegment list) =
-        [ for (display, stems) in HitTerms.all do
-              match
-                  segments
-                  |> List.tryFind (fun s ->
-                      let low = s.Text.ToLowerInvariant()
-                      stems |> List.forall low.Contains)
-              with
-              | Some seg ->
-                  let low = seg.Text.ToLowerInvariant()
-                  let idx = firstIndex low stems
-                  let start = max 0 (idx - 80)
-                  let len = min (seg.Text.Length - start) 220
-                  yield display, seg.Text.Substring(start, len), seg.StartMs
-              | None -> () ]
-
-    /// Same as findHits, but over a flat transcript where timestamps are gone.
-    let hitsFromText (text: string) =
-        let low = text.ToLowerInvariant()
-
-        [ for (display, stems) in HitTerms.all do
-              if stems |> List.forall low.Contains then
-                  let idx = firstIndex low stems
-                  let start = max 0 (idx - 80)
-                  let len = min (text.Length - start) 220
-                  yield display, text.Substring(start, len), 0 ]
-
-    let private runCaptionStage (options: ScanOptions) =
+    let private processItem (exe: string) (topicId: int64) (stems: string list) (options: ScanOptions) (item: Frontier_row) =
         task {
-            let exe = YtDlp.resolvePath Settings.ytDlpPath
-            let mutable processed = 0
-            let mutable go = true
+            counters.Current <- sprintf "d%d %s" item.depth item.video_id
+            counters.Depth <- item.depth
+            render ()
 
-            while go && (options.Limit <= 0 || processed < options.Limit) do
-                use conn = Db.openConnection()
-                let v = claimVideo conn
+            let! transcript = ensureTranscript exe item.video_id
 
-                if isNull (box v) then
-                    go <- false
-                else
-                    counters.Current <- sprintf "%s  %s" v.id v.title
-                    render ()
+            let hits =
+                match transcript with
+                | Ok(Some segments) ->
+                    counters.Captions <- counters.Captions + 1
+                    hitsFromSegments stems segments
+                | Ok None ->
+                    let stored = Db.getTranscript item.video_id
 
-                    let! meta = YtDlp.fetchMeta exe v.id
+                    if isNull (box stored) then [] else hitsFromText stems stored.text
+                | Error(NoCaptions _) ->
+                    counters.NoCaptions <- counters.NoCaptions + 1
+                    []
+                | Error(Transient _) -> []
 
-                    match meta with
-                    | Error reason ->
-                        counters.Failed <- counters.Failed + 1
-                        let attempts = v.attempts + 1
-                        let state = if attempts >= 3 then "failed" else "pending"
+            if not hits.IsEmpty then
+                Db.insertHits topicId item.video_id hits
+                counters.Hits <- counters.Hits + hits.Length
 
-                        conn.Execute(
-                            """
-update video set state = @state, attempts = @attempts, last_error = @err, updated_at = now()
-where id = @id
-""",
-                            {| state = state
-                               attempts = attempts
-                               err = reason
-                               id = v.id |}
-                        )
-                        |> ignore
+                Log.Information(
+                    "hits: {Video} depth {Depth} -> {Terms}",
+                    item.video_id,
+                    item.depth,
+                    hits |> List.map (fun (t, _, _) -> t) |> String.concat ", "
+                )
 
-                        Log.Warning("meta failed ({Attempts}): {Video} — {Reason}", attempts, v.id, reason)
-                    | Ok m ->
-                        let! transcript = Transcript.fetch m.Captions
+            // Expand regardless of the transcript outcome: a video without
+            // captions is still a node in the recommendation graph, and the
+            // whole point is to keep walking.
+            let! related = YouTube.relatedVideos item.video_id options.RelatedLimit
 
-                        match transcript with
-                        | Ok segments ->
-                            let text = Transcript.toText segments
+            for (id, _title) in related do
+                Db.enqueue topicId id (item.depth + 1) item.video_id "related"
 
-                            conn.Execute(
-                                """
-insert into transcript (video_id, lang, source, text, chars)
-values (@video_id, 'ru', 'captions', @text, @chars)
-on conflict (video_id) do update
-set text = excluded.text, chars = excluded.chars, fetched_at = now()
-""",
-                                {| video_id = v.id
-                                   text = text
-                                   chars = text.Length |}
-                            )
-                            |> ignore
+            match transcript with
+            | Error(Transient reason) ->
+                counters.Failed <- counters.Failed + 1
+                Db.markFrontierRetry topicId item.video_id item.attempts
+                Log.Warning("transient: {Video} depth {Depth} — {Reason}", item.video_id, item.depth, reason)
+            | _ ->
+                Db.markExpanded topicId item.video_id
 
-                            let hits = findHits segments
-                            Db.insertHits v.id hits
-                            counters.Hits <- counters.Hits + hits.Length
-
-                            conn.Execute(
-                                """
-update video set state = 'done', has_captions = true, attempts = attempts + 1,
-       last_error = null, duration = @duration, published = @published, updated_at = now()
-where id = @id
-""",
-                                {| duration = m.Duration
-                                   published = parseUploadDate m.UploadDate
-                                   id = v.id |}
-                            )
-                            |> ignore
-
-                            counters.Captions <- counters.Captions + 1
-                            Log.Information("captions: {Video} {Chars} chars", v.id, text.Length)
-                        | Error reason ->
-                            counters.NoCaptions <- counters.NoCaptions + 1
-
-                            conn.Execute(
-                                """
-update video set state = 'no_captions', has_captions = false, attempts = attempts + 1,
-       last_error = @err, duration = @duration, updated_at = now()
-where id = @id
-""",
-                                {| err = reason
-                                   duration = m.Duration
-                                   id = v.id |}
-                            )
-                            |> ignore
-
-                            Log.Information("no captions: {Video} — {Reason}", v.id, reason)
-
-                    processed <- processed + 1
-                    render ()
-                    heartbeat ()
-                    do! Http.delay options.DelayMs
+                Log.Information(
+                    "expanded: {Video} depth {Depth} -> {Related} related",
+                    item.video_id,
+                    item.depth,
+                    related.Length
+                )
         }
 
     // ------------------------------------------------------------ entry
@@ -344,22 +231,53 @@ where id = @id
     let run (options: ScanOptions) : Task<unit> =
         task {
             counters.StartedAt <- DateTime.UtcNow
-            enqueueQueries options.Queries
-            Log.Information("queued queries, pending: {Count}", counters.QueriesTotal)
+            counters.Topic <- options.Topic
 
-            do! runSearchStage options
-            do! runCaptionStage options
+            let topicId = Db.ensureTopic options.Topic options.Stems
+            let stems = Db.topicStems topicId
+
+            Log.Information(
+                "topic {Topic} (id {Id}), terms: {Stems}",
+                options.Topic,
+                topicId,
+                String.concat ", " stems
+            )
+
+            // crash recovery: whatever was mid-flight goes back to the queue
+            Db.resetRunning topicId
+
+            for videoId in options.SeedVideos do
+                Db.enqueue topicId videoId 0 null "seed"
+                Log.Information("seed: {Video}", videoId)
+
+            counters.Queued <- Db.queuedCount topicId
+            Console.WriteLine(sprintf "topic: %s | queued: %d" options.Topic counters.Queued)
+
+            let exe = YtDlp.resolvePath Settings.ytDlpPath
+            let mutable go = true
+
+            while go && (options.Limit <= 0 || counters.Expanded < options.Limit) do
+                let item = Db.claimFrontier topicId
+
+                if isNull (box item) then
+                    go <- false
+                else
+                    do! processItem exe topicId stems options item
+                    counters.Expanded <- counters.Expanded + 1
+                    counters.Queued <- Db.queuedCount topicId
+                    render ()
+                    heartbeat ()
+                    do! Http.delay options.DelayMs
 
             Console.WriteLine()
             heartbeat ()
 
             Log.Information(
-                "scan finished: queries {Q}, found {Found}, new {New}, captions {Caps}, no captions {NoCaps}, failed {Failed}",
-                counters.QueriesDone,
-                counters.VideosFound,
-                counters.VideosNew,
+                "frontier empty, stopping. expanded {Expanded}, captions {Caps}, no captions {NoCaps}, hits {Hits}, failed {Failed}",
+                counters.Expanded,
                 counters.Captions,
                 counters.NoCaptions,
+                counters.Hits,
                 counters.Failed
             )
         }

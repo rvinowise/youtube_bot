@@ -250,6 +250,32 @@ let channelShorts (channelId: string) (maxPages: int) : Task<(string * string) l
             return List.ofSeq items
     }
 
+/// Videos recommended next to `videoId` — the watch page sidebar.
+/// This is the edge set the BFS walks.
+let relatedVideos (videoId: string) (limit: int) : Task<(string * string) list> =
+    task {
+        let! htmlOpt = Http.tryGetString (sprintf "https://www.youtube.com/watch?v=%s" videoId)
+
+        match htmlOpt with
+        | None -> return []
+        | Some html ->
+            let entries = ResizeArray<string * string>()
+            let blocks = splitBlocks markerLockup html
+
+            for i in 1 .. blocks.Length - 1 do
+                let c = clamp 20000 blocks.[i]
+
+                match tryGroup pContentId c 1, tryText pLockupTitle c with
+                | Some id, Some title when id <> videoId -> entries.Add(id, title)
+                | _ -> ()
+
+            return
+                entries
+                |> Seq.distinctBy fst
+                |> Seq.truncate limit
+                |> List.ofSeq
+    }
+
 // ---------------------------------------------------------------- playlist
 
 /// Items of a playlist as (videoId, title).

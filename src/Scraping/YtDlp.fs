@@ -93,11 +93,42 @@ module YtDlp =
         | true, caps when caps.ValueKind = JsonValueKind.Object -> fromObject caps "ru"
         | _ -> []
 
+    /// Errors that will never succeed on retry: the video is gone, private,
+    /// age-gated, or YouTube returns a stub with only storyboard formats.
+    let isPermanentError (message: string) =
+        let m = message.ToLowerInvariant()
+
+        [ "requested format is not available"
+          "video unavailable"
+          "private video"
+          "this video is not available"
+          "has been removed"
+          "members-only"
+          "confirm your age"
+          "age-restricted"
+          "account associated with this video has been terminated" ]
+        |> List.exists m.Contains
+
+    /// `-4` is mandatory (IPv6 route times out), cookies defeat the bot check.
+    let private buildArgs (videoId: string) =
+        let cookies =
+            if String.IsNullOrWhiteSpace Settings.cookiesFromBrowser then ""
+            else sprintf "--cookies-from-browser \"%s\" " Settings.cookiesFromBrowser
+
+        let extra =
+            if String.IsNullOrWhiteSpace Settings.extraArgs then ""
+            else Settings.extraArgs.Trim() + " "
+
+        sprintf
+            "-4 %s%s--no-warnings --skip-download -J \"https://www.youtube.com/watch?v=%s\""
+            cookies
+            extra
+            videoId
+
     /// `yt-dlp -4 -J` for one video.
     let fetchMeta (exe: string) (videoId: string) : Task<Result<VideoMeta, string>> =
         task {
-            let args =
-                sprintf "-4 --no-warnings --skip-download -J \"https://www.youtube.com/watch?v=%s\"" videoId
+            let args = buildArgs videoId
 
             let! stdout, stderr, code = run exe args
 

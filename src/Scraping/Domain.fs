@@ -74,23 +74,44 @@ type ScannedChannel =
       HitVideos: VideoHit list
       Url: string }
 
-/// Vocabulary that gets pre-computed into the `hit` table at caption time.
-/// (display form, stems that must ALL be present in the same segment)
-///
-/// Multi-word terms need every stem: matching "цифров" alone hits
-/// "матриц цифровых камер", which is not about digital immortality at all.
+/// A topic is a named set of terms. A term is a `+`-joined conjunction of
+/// stems: `"загрузк+сознани"` matches only segments that contain both, which
+/// is what keeps "матриц цифровых камер" out of the digital-immortality hits.
 module HitTerms =
-    let all =
-        [ "бессмертие", [ "бессмерт" ]
-          "иммортализм", [ "иммортал" ]
-          "трансгуманизм", [ "трансгуман" ]
-          "крионика", [ "крионик" ]
-          "вечная жизнь", [ "вечн"; "жизн" ]
-          "загрузка сознания", [ "загрузк"; "сознани" ]
-          "цифровое бессмертие", [ "цифров"; "бессмерт" ]
-          "продление жизни", [ "продлени"; "жизн" ]
-          "старение", [ "старени" ]
-          "воскрешение", [ "воскрес" ] ]
+
+    /// Default vocabulary for the immortality / transhumanism topic.
+    let defaultStems =
+        [ "бессмерт"
+          "иммортал"
+          "трансгуман"
+          "крионик"
+          "вечн+жизн"
+          "загрузк+сознани"
+          "цифров+бессмерт"
+          "продлени+жизн"
+          "старени"
+          "воскрес" ]
+
+    /// `"загрузк+сознани"` -> `["загрузк"; "сознани"]`.
+    let stemsOf (term: string) : string list =
+        term.Split '+'
+        |> Array.map (fun s -> s.Trim().ToLowerInvariant())
+        |> Array.filter (fun s -> s <> "")
+        |> List.ofArray
+
+    /// True when every stem of the term occurs in `text` (already lowercased).
+    let matches (lowerText: string) (term: string) =
+        let stems = stemsOf term
+        not stems.IsEmpty && stems |> List.forall lowerText.Contains
+
+    /// Position of the first stem that is actually present.
+    let firstIndex (lowerText: string) (term: string) =
+        stemsOf term
+        |> List.map lowerText.IndexOf
+        |> List.filter (fun i -> i >= 0)
+        |> function
+            | [] -> 0
+            | xs -> List.min xs
 
 module Domain =
     /// Parse "1,88 тыс. подписчиков" / "1,2 млн" / "759 подписчиков" into a number.
