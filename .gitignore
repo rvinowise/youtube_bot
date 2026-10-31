@@ -1,0 +1,20 @@
+# .NET build output
+bin/
+obj/
+out/
+*.user
+
+# IDE / agent
+.idea/
+.zoo/
+
+# third-party binary, see README for the download link
+utils/yt-dlp.exe
+
+# scraper output
+work/
+*.log
+yt_blogger_candidates.tsv
+yt_blogger_videos.tsv
+yt_thumbs/
+"code-export.yaml"  
