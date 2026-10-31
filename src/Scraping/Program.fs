@@ -20,6 +20,8 @@ USAGE
   scraping videos [--state S] [--term T]  list videos with URLs and transcript size
   scraping hits [--topic T] [--term X]    pre-computed term mentions with timestamps
   scraping backfill --topic T             recompute hits for transcripts that have none
+  scraping requeue --topic T [--with-no-captions]
+                                          retry failed / caption-less videos of a topic
   scraping sql --query "select ..."       run arbitrary SQL, print a table
   scraping find --term "бессмертие"       search the collected transcripts
   scraping find-bloggers  [options]
@@ -35,7 +37,7 @@ SCAN OPTIONS
                         (default: the built-in immortality vocabulary)
   --seed-video ID[,ID]  starting video(s); repeatable, idempotent
   --related N           recommendations taken per video (default 20)
-  --delay N             pause between videos, ms (default 300)
+  --delay N             pause between videos, ms (default 2000)
   --limit N             stop after N expanded videos (0 = never, default)
 
 FIND-BLOGGERS OPTIONS
@@ -394,6 +396,36 @@ let private splitCsv (s: string) =
     |> Array.filter (String.IsNullOrWhiteSpace >> not)
     |> List.ofArray
 
+let private requeueCommand (args: string list) : Task<int> =
+    task {
+        Db.init Settings.connectionString
+        Db.migrate ()
+
+        let topic = valueOf args "--topic" ""
+
+        if topic = "" then
+            Console.WriteLine "missing --topic"
+            return 1
+        else
+            match Db.topicIdByName topic with
+            | None ->
+                Console.WriteLine(sprintf "no such topic: %s" topic)
+                return 1
+            | Some topicId ->
+                let withNoCaptions = flag args "--with-no-captions"
+                let n = Db.requeueFailed topicId withNoCaptions
+
+                Console.WriteLine(
+                    sprintf
+                        "requeued: %d item(s) in topic %s%s"
+                        n
+                        topic
+                        (if withNoCaptions then " (incl. no_captions)" else "")
+                )
+
+                return 0
+    }
+
 let private scanCommand (args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
@@ -417,7 +449,7 @@ let private scanCommand (args: string list) : Task<int> =
                   Stems = stems
                   SeedVideos = seeds
                   RelatedLimit = intOf args "--related" 20
-                  DelayMs = intOf args "--delay" 300
+                  DelayMs = intOf args "--delay" 2000
                   Limit = intOf args "--limit" 0 }
 
             Console.WriteLine(
@@ -454,6 +486,7 @@ let main argv =
         | "videos" -> videosCommand rest
         | "hits" -> hitsCommand rest
         | "backfill" -> backfillCommand rest
+        | "requeue" -> requeueCommand rest
         | "sql" -> sqlCommand rest
         | "find" -> findCommand rest
         | "find-bloggers" -> findBloggers rest

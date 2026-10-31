@@ -12,6 +12,11 @@ code-export.yaml
 # third-party binary, see README for the download link
 utils/yt-dlp.exe
 
+# secrets -- never commit
+*.key
+tools/openrouter.key
+.env
+
 # scraper output
 work/
 *.log

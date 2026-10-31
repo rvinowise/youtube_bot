@@ -142,6 +142,7 @@ module Scan =
             let existing = Db.getTranscript videoId
 
             if not (isNull (box existing)) then
+                Db.markVideoCached videoId
                 return Ok None
             else
                 let! meta = YtDlp.fetchMeta exe videoId
@@ -255,13 +256,28 @@ module Scan =
 
             let exe = YtDlp.resolvePath Settings.ytDlpPath
             let mutable go = true
+            let mutable idleRounds = 0
 
             while go && (options.Limit <= 0 || counters.Expanded < options.Limit) do
                 let item = Db.claimFrontier topicId
 
                 if isNull (box item) then
-                    go <- false
+                    // Everything queued is waiting out its backoff. Keep the
+                    // process alive for a while instead of reporting "done",
+                    // but do not spin forever if the queue is stuck.
+                    let queued = Db.queuedCount topicId
+
+                    if queued > 0 && idleRounds < 60 then
+                        idleRounds <- idleRounds + 1
+                        counters.Queued <- queued
+                        counters.Current <- sprintf "backoff, %d queued" queued
+                        render ()
+                        heartbeat ()
+                        do! Http.delay 15000
+                    else
+                        go <- false
                 else
+                    idleRounds <- 0
                     do! processItem exe topicId stems options item
                     counters.Expanded <- counters.Expanded + 1
                     counters.Queued <- Db.queuedCount topicId

@@ -134,10 +134,13 @@ create table if not exists frontier (
     state     text not null default 'queued',
     attempts  int  not null default 0,
     added_at  timestamptz not null default now(),
+    next_attempt_at timestamptz not null default now(),
     primary key (topic_id, video_id)
 );
 
-create index if not exists frontier_queue_idx on frontier (topic_id, state, depth, added_at);
+alter table frontier add column if not exists next_attempt_at timestamptz not null default now();
+
+create index if not exists frontier_queue_idx on frontier (topic_id, state, next_attempt_at);
 
 create table if not exists video (
     id             text primary key,
@@ -215,6 +218,13 @@ create index if not exists hit_topic_idx on hit (topic_id, term);
 
         conn.ExecuteScalar<int64>("select id from topic where name = @name", {| name = name |})
 
+    let topicIdByName (name: string) : int64 option =
+        use conn = openConnection()
+
+        match conn.ExecuteScalar<Nullable<int64>>("select id from topic where name = @name", {| name = name |}) with
+        | n when n.HasValue -> Some n.Value
+        | _ -> None
+
     let topicStems (topicId: int64) : string list =
         use conn = openConnection()
 
@@ -257,7 +267,7 @@ order by t.id
         use conn = openConnection()
 
         conn.Execute(
-            "update frontier set state = 'queued' where topic_id = @topic and state = 'running'",
+            "update frontier set state = 'queued', next_attempt_at = now() where topic_id = @topic and state = 'running'",
             {| topic = topicId |}
         )
         |> ignore
@@ -302,8 +312,8 @@ update frontier set state = 'running', attempts = attempts + 1
 where (topic_id, video_id) = (
     select topic_id, video_id
     from frontier
-    where topic_id = @topic and state = 'queued'
-    order by depth, added_at
+    where topic_id = @topic and state = 'queued' and next_attempt_at <= now()
+    order by depth, next_attempt_at
     limit 1
     for update skip locked
 )
@@ -321,15 +331,24 @@ returning topic_id, video_id, depth, parent_id, state, attempts
         )
         |> ignore
 
-    /// After a failure: retry up to 3 times, then give up.
+    /// After a transient failure: retry with exponential backoff, give up after
+    /// 5 attempts. The backoff matters: a 429 would otherwise be retried at
+    /// once, burn the attempt budget and mark a perfectly good video `failed`.
     let markFrontierRetry (topicId: int64) (videoId: string) (attempts: int) =
         use conn = openConnection()
 
-        let state = if attempts >= 3 then "failed" else "queued"
+        let state = if attempts >= 5 then "failed" else "queued"
+        let delaySeconds = attempts * attempts * 30
 
         conn.Execute(
-            "update frontier set state = @state where topic_id = @topic and video_id = @video",
+            """
+update frontier
+set state = @state,
+    next_attempt_at = now() + make_interval(secs => @delay)
+where topic_id = @topic and video_id = @video
+""",
             {| state = state
+               delay = delaySeconds
                topic = topicId
                video = videoId |}
         )
@@ -394,6 +413,20 @@ where id = @id
         )
         |> ignore
 
+    /// The transcript was fetched earlier by another topic (or an earlier run),
+    /// so yt-dlp never saw this video now. Still move it out of `pending`.
+    let markVideoCached (videoId: string) =
+        use conn = openConnection()
+
+        conn.Execute(
+            """
+update video set state = 'done', has_captions = true, last_error = null, updated_at = now()
+where id = @id and state <> 'done'
+""",
+            {| id = videoId |}
+        )
+        |> ignore
+
     let markVideoNoCaptions (videoId: string) (reason: string) (duration: int) =
         use conn = openConnection()
 
@@ -420,6 +453,35 @@ where id = @id
             {| err = reason; id = videoId |}
         )
         |> ignore
+
+    /// Put every failed item of a topic back in the queue and clear the retry
+    /// counters. Needed after the YouTube bot check or a transient outage --
+    /// otherwise those videos stay failed forever.
+    let requeueFailed (topicId: int64) (alsoNoCaptions: bool) : int =
+        use conn = openConnection()
+
+        let states = if alsoNoCaptions then [ "failed"; "no_captions" ] else [ "failed" ]
+
+        let n =
+            conn.Execute(
+                """
+update frontier set state = 'queued', attempts = 0, next_attempt_at = now()
+where topic_id = @topic and state = any(@states)
+""",
+                {| topic = topicId; states = List.toArray states |}
+            )
+
+        conn.Execute(
+            """
+update video v set attempts = 0, last_error = null, state = 'pending', updated_at = now()
+where v.state in ('failed', 'no_captions')
+  and exists (select 1 from frontier f where f.video_id = v.id and f.topic_id = @topic and f.state = 'queued')
+""",
+            {| topic = topicId |}
+        )
+        |> ignore
+
+        n
 
     // ------------------------------------------------------------ hits
 

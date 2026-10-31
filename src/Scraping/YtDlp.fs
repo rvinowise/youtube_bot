@@ -93,13 +93,14 @@ module YtDlp =
         | true, caps when caps.ValueKind = JsonValueKind.Object -> fromObject caps "ru"
         | _ -> []
 
-    /// Errors that will never succeed on retry: the video is gone, private,
-    /// age-gated, or YouTube returns a stub with only storyboard formats.
+    /// Errors that will never succeed on retry: the video is gone, private or
+    /// age-gated. NOTE: "requested format is not available" is NOT in this list
+    /// any more -- `--ignore-no-formats-error` (always passed below) turns it
+    /// into a successful run, because we only need the caption URLs.
     let isPermanentError (message: string) =
         let m = message.ToLowerInvariant()
 
-        [ "requested format is not available"
-          "video unavailable"
+        [ "video unavailable"
           "private video"
           "this video is not available"
           "has been removed"
@@ -110,6 +111,12 @@ module YtDlp =
         |> List.exists m.Contains
 
     /// `-4` is mandatory (IPv6 route times out), cookies defeat the bot check.
+    ///
+    /// `--ignore-no-formats-error` is mandatory too: YouTube's `n` challenge
+    /// makes yt-dlp drop every real format (it needs a JS runtime), so a plain
+    /// `-J` exits non-zero with "Requested format is not available" even though
+    /// `automatic_captions` is fully populated. We never download media, only
+    /// caption URLs, so those missing formats are irrelevant.
     let private buildArgs (videoId: string) =
         let cookies =
             if String.IsNullOrWhiteSpace Settings.cookiesFromBrowser then ""
@@ -120,7 +127,7 @@ module YtDlp =
             else Settings.extraArgs.Trim() + " "
 
         sprintf
-            "-4 %s%s--no-warnings --skip-download -J \"https://www.youtube.com/watch?v=%s\""
+            "-4 %s--ignore-no-formats-error %s--no-warnings --skip-download -J \"https://www.youtube.com/watch?v=%s\""
             cookies
             extra
             videoId
