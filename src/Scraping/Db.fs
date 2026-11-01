@@ -229,6 +229,18 @@ create index if not exists hit_topic_idx on hit (topic_id, term);
         | n when n.HasValue -> Some n.Value
         | _ -> None
 
+    /// Replace the vocabulary of an existing topic (used when `--stems` is
+    /// passed explicitly: without this, the stems of an existing topic were
+    /// silently ignored).
+    let setTopicStems (topicId: int64) (stems: string list) =
+        use conn = openConnection()
+
+        conn.Execute(
+            "update topic set stems = @stems where id = @id",
+            {| id = topicId; stems = List.toArray stems |}
+        )
+        |> ignore
+
     let topicStems (topicId: int64) : string list =
         use conn = openConnection()
 
@@ -450,6 +462,29 @@ where id = @id
         )
         |> ignore
 
+    let videoChannel (videoId: string) : string =
+        use conn = openConnection()
+
+        conn.ExecuteScalar<string>(
+            "select coalesce(channel_name, '') from video where id = @id",
+            {| id = videoId |}
+        )
+
+    /// How many videos of this channel the topic has already expanded.
+    let channelExpandedCount (topicId: int64) (channel: string) : int =
+        use conn = openConnection()
+
+        conn.ExecuteScalar<int64>(
+            """
+select count(*)
+from frontier f
+join video v on v.id = f.video_id
+where f.topic_id = @topic and f.state = 'expanded' and v.channel_name = @channel
+""",
+            {| topic = topicId; channel = channel |}
+        )
+        |> int
+
     /// Videos still missing a title, shallowest first. `limit <= 0` = all of
     /// them (`LIMIT 0` in Postgres would return nothing, hence the NULL).
     let videosWithoutTitles (limit: int) : string list =
@@ -628,6 +663,42 @@ limit @limit
                term = term
                pattern = "%" + term + "%"
                limit = limit |}
+        )
+        |> Seq.toList
+
+    type ChannelRow =
+        { channel: string
+          url: string
+          videos: int64
+          mentions: int64
+          depth: int
+          sample: string }
+
+    /// Hits grouped by channel: the point is to find *people*, not videos.
+    /// A channel with 3 mentions in 3 different videos is a much better lead
+    /// than a factory channel with 1 mention in 1 video.
+    let listChannels (topicName: string) (term: string) (limit: int) =
+        use conn = openConnection()
+
+        conn.Query<ChannelRow>(
+            """
+select v.channel_name as channel,
+       coalesce((array_agg(distinct v.channel_url))[1], '') as url,
+       count(distinct h.video_id) as videos,
+       count(*) as mentions,
+       min(v.depth) as depth,
+       (array_agg(v.title order by v.depth))[1] as sample
+from hit h
+join video v on v.id = h.video_id
+join topic t on t.id = h.topic_id
+where (@topic = '' or t.name = @topic)
+  and (@term = '' or h.term = @term)
+  and v.channel_name <> ''
+group by v.channel_name
+order by mentions desc, videos desc
+limit @limit
+""",
+            {| topic = topicName; term = term; limit = limit |}
         )
         |> Seq.toList
 

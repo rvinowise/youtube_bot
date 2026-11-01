@@ -19,6 +19,8 @@ USAGE
   scraping db                             check the database and apply the schema
   scraping videos [--state S] [--term T]  list videos with URLs and transcript size
   scraping hits [--topic T] [--term X]    pre-computed term mentions with timestamps
+  scraping channels [--topic T] [--term X]
+                                          hits grouped by channel -- who to talk to
   scraping backfill --topic T             recompute hits for transcripts that have none
   scraping backfill-titles [--limit N]    fill missing titles/channels via oEmbed
   scraping requeue --topic T [--with-no-captions]
@@ -38,6 +40,7 @@ SCAN OPTIONS
                         (default: the built-in immortality vocabulary)
   --seed-video ID[,ID]  starting video(s); repeatable, idempotent
   --related N           recommendations taken per video (default 20)
+  --max-per-channel N   stop expanding a channel after N videos (0 = no cap)
   --delay N             pause between videos, ms (default 2000)
   --limit N             stop after N expanded videos (0 = never, default)
 
@@ -312,6 +315,29 @@ let private backfillTitlesCommand (args: string list) : Task<int> =
         return 0
     }
 
+let private channelsCommand (args: string list) : Task<int> =
+    task {
+        Db.init Settings.connectionString
+        let topic = valueOf args "--topic" ""
+        let term = valueOf args "--term" ""
+        let limit = intOf args "--limit" 50
+        let rows = Db.listChannels topic term limit
+
+        Console.WriteLine(sprintf "channels: %d" rows.Length)
+
+        printTable
+            [ "channel"; "videos"; "mentions"; "d"; "url"; "sample" ]
+            [ for r in rows ->
+                  [ r.channel
+                    string r.videos
+                    string r.mentions
+                    string r.depth
+                    r.url
+                    r.sample ] ]
+
+        return 0
+    }
+
 let private hitsCommand (args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
@@ -487,11 +513,17 @@ let private scanCommand (args: string list) : Task<int> =
 
             let seeds = splitCsv (valueOf args "--seed-video" "")
 
+            // An explicit --stems must also update an existing topic, otherwise
+            // the flag is silently ignored for every run but the first.
+            if valueOf args "--stems" "" <> "" then
+                Db.setTopicStems (Db.ensureTopic topic stems) stems
+
             let options =
                 { Topic = topic
                   Stems = stems
                   SeedVideos = seeds
                   RelatedLimit = intOf args "--related" 20
+                  MaxPerChannel = intOf args "--max-per-channel" 0
                   DelayMs = intOf args "--delay" 2000
                   Limit = intOf args "--limit" 0 }
 
@@ -528,6 +560,7 @@ let main argv =
         | "db" -> dbCommand rest
         | "videos" -> videosCommand rest
         | "hits" -> hitsCommand rest
+        | "channels" -> channelsCommand rest
         | "backfill" -> backfillCommand rest
         | "backfill-titles" -> backfillTitlesCommand rest
         | "requeue" -> requeueCommand rest

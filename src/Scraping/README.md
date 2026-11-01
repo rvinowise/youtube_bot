@@ -56,6 +56,7 @@ per topic, so two topics explore independently.
 | `scan` | endless BFS: claim frontier → transcript → hits → expand related |
 | `topics` | topics with queue, expanded, video and hit counts |
 | `hits` | pre-computed term mentions with timestamps and deep links |
+| `channels` | hits grouped by channel — the actual "who to talk to" list |
 | `videos` | every visited video with URL, state, depth, transcript size |
 | `find` | ad-hoc search over the collected transcripts |
 | `backfill` | recompute hits for transcripts that have none |
@@ -80,6 +81,7 @@ dotnet run --project src/Scraping -- scan \
 | `--stems` | built-in immortality vocabulary | `"a,b+c,d"`; `+` = all stems in one segment |
 | `--seed-video` | — | starting video(s), comma separated, idempotent |
 | `--related` | 20 | recommendations taken per video |
+| `--max-per-channel` | 0 | stop expanding a channel after N videos (0 = no cap) |
 | `--delay` | 2000 | pause between videos, ms; below ~1 s YouTube answers 429 |
 | `--limit` | 0 | stop after N expanded videos (0 = never) |
 
@@ -211,6 +213,27 @@ utils/yt-dlp.exe -4 --cookies-from-browser firefox --ignore-no-formats-error \
 works without a code change. `--cookies-from-browser` and
 `--ignore-no-formats-error` are always passed by [`YtDlp.fs`](YtDlp.fs).
 
+## Who to talk to
+
+`hits` answers "which videos mention it"; `channels` answers "which *people*
+mention it", which is the actual goal:
+
+```bash
+dotnet run --project src/Scraping -- channels --topic immortality --limit 25
+```
+
+```
+channel              videos  mentions  d  url                                  sample
+Сонный Ученый        22      23        1  https://youtube.com/@сонный-ученый    Если законы физики работают в обе стороны…
+Глеб Соломин         4       10        3  https://youtube.com/@glebsolomin      ИИ ЗАБЕРЁТ твою работу к 2027…
+```
+
+A channel with 3 mentions in 3 different videos is a much better lead than a
+factory channel with 1 mention in 1 video — but the factory will dominate the
+raw counts, which is why `--max-per-channel` exists: after N videos of the same
+channel the scanner still scores them, but stops walking that channel's
+neighbourhood. `--max-per-channel 5` is a good default for a focused run.
+
 ## Titles and channels
 
 `hits` and `videos` show the channel name next to the title, because a title
@@ -281,5 +304,9 @@ above, Gemini suggested a Playwright stealth extractor, while the actual fix was
   ~160 000. Watch `queued` in the progress line.
 - **~3–5 s per video** (`-J` with cookies + captions + watch page), so
   ~800–1 200 videos/hour at `--delay 2000`.
+- **Stems are naive.** `"воскрес"` matched "воскресенье" (Sunday) and produced
+  145 false hits; the vocabulary now uses `"воскресени"`. Any single stem will
+  still catch metaphors ("бессмертная память", "бессмертное наследие") — use
+  `+`-conjunctions when precision matters.
 - **No ASR.** Videos without auto-captions are marked `no_captions` and skipped
   (but still expanded). Adding `whisper.cpp` on the audio path is the next step.

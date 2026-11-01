@@ -12,6 +12,8 @@ type ScanOptions =
       Stems: string list
       SeedVideos: string list
       RelatedLimit: int
+      /// 0 = no cap. Otherwise stop expanding a channel after N videos.
+      MaxPerChannel: int
       DelayMs: int
       /// Stop after N expanded videos. 0 = run until the frontier is empty
       /// (which, with a live recommendation graph, means "until you kill it").
@@ -211,10 +213,25 @@ module Scan =
                     hits |> List.map (fun (t, _, _) -> t) |> String.concat ", "
                 )
 
+            // Per-channel cap: one "sleep science" factory can otherwise fill
+            // the whole frontier with near-identical videos. We still score the
+            // video, we just stop walking its neighbourhood.
+            let channel = Db.videoChannel item.video_id
+
+            let capped =
+                options.MaxPerChannel > 0
+                && channel <> ""
+                && Db.channelExpandedCount topicId channel >= options.MaxPerChannel
+
             // Expand regardless of the transcript outcome: a video without
             // captions is still a node in the recommendation graph, and the
             // whole point is to keep walking.
-            let! related = YouTube.relatedVideos item.video_id options.RelatedLimit
+            let! related =
+                if capped then
+                    Log.Information("channel cap: {Channel} ({Video}) — not expanding", channel, item.video_id)
+                    Task.FromResult []
+                else
+                    YouTube.relatedVideos item.video_id options.RelatedLimit
 
             for (id, _title) in related do
                 Db.enqueue topicId id (item.depth + 1) item.video_id "related"
