@@ -257,6 +257,7 @@ module Scan =
             let exe = YtDlp.resolvePath Settings.ytDlpPath
             let mutable go = true
             let mutable idleRounds = 0
+            let mutable consecutiveFailures = 0
 
             while go && (options.Limit <= 0 || counters.Expanded < options.Limit) do
                 let item = Db.claimFrontier topicId
@@ -278,11 +279,29 @@ module Scan =
                         go <- false
                 else
                     idleRounds <- 0
+                    let failedBefore = counters.Failed
                     do! processItem exe topicId stems options item
                     counters.Expanded <- counters.Expanded + 1
                     counters.Queued <- Db.queuedCount topicId
                     render ()
                     heartbeat ()
+
+                    if counters.Failed > failedBefore then
+                        consecutiveFailures <- consecutiveFailures + 1
+
+                        if consecutiveFailures >= 3 then
+                            // Global rate limit: happening one video after
+                            // another with a per-video backoff still queued.
+                            // Pause the whole scanner, otherwise an overnight
+                            // run makes no progress at all.
+                            counters.Current <- "cooling down 5 min"
+                            render ()
+                            Log.Warning("rate limit: cooling down 5 min after {N} consecutive failures", consecutiveFailures)
+                            do! Http.delay 300000
+                            consecutiveFailures <- 0
+                    else
+                        consecutiveFailures <- 0
+
                     do! Http.delay options.DelayMs
 
             Console.WriteLine()

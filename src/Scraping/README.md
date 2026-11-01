@@ -101,7 +101,25 @@ Live progress line (redrawn with `\r`):
 Plus `work/progress.json` (heartbeat after every video) and
 `work/scrapingYYYYMMDD.log` (Serilog compact JSON).
 
-Run detached:
+Run detached (survives closing the terminal — the parent shell exits and the
+scanner is orphaned, so keep the machine awake):
+
+```powershell
+Start-Process -FilePath "src\Scraping\bin\Release\net10.0\Scraping.exe" `
+  -ArgumentList 'scan','--topic','immortality','--seed-video','KES9yb3o-4Q','--related','20','--delay','4000' `
+  -WorkingDirectory "C:\prj\browsing" `
+  -RedirectStandardOutput "C:\prj\browsing\work\night_out.log" `
+  -RedirectStandardError  "C:\prj\browsing\work\night_err.log" `
+  -WindowStyle Hidden
+Get-Process Scraping                      # pid, CPU
+Get-Content work\progress.json -Raw       # counters
+Stop-Process -Name Scraping               # stop it
+```
+
+Build once first with `dotnet build src\Scraping\Scraping.fsproj -c Release`; the
+`bin\Release\...\Scraping.exe` path skips the `dotnet run` build step.
+
+Alternate foreground form:
 
 ```bash
 Start-Process dotnet -ArgumentList "run --project src\Scraping -- scan --topic immortality --seed-video XXX" `
@@ -178,6 +196,9 @@ utils/yt-dlp.exe -4 --cookies-from-browser firefox --ignore-no-formats-error \
   "Could not copy Chrome cookie database" while Chrome is running.
 - **Rate limit is real.** With `--delay 300` YouTube starts answering
   `429 Too Many Requests` after ~5 videos. `--delay 2000` or more is stable.
+- If three videos in a row fail transiently, the scanner pauses **5 minutes**
+  globally and logs `rate limit: cooling down 5 min`, then resumes. Without
+  this an unattended night run gets nothing done once the IP is throttled.
 - If the bot check returns anyway, wait, or use a proxy
   (`yt_dlp.extra_args: "--ignore-no-formats-error --proxy http://host:port"`).
 - Videos that failed during an earlier outage are not retried automatically —
