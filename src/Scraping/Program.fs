@@ -20,6 +20,7 @@ USAGE
   scraping videos [--state S] [--term T]  list videos with URLs and transcript size
   scraping hits [--topic T] [--term X]    pre-computed term mentions with timestamps
   scraping backfill --topic T             recompute hits for transcripts that have none
+  scraping backfill-titles [--limit N]    fill missing titles/channels via oEmbed
   scraping requeue --topic T [--with-no-captions]
                                           retry failed / caption-less videos of a topic
   scraping sql --query "select ..."       run arbitrary SQL, print a table
@@ -274,6 +275,43 @@ let private backfillCommand (args: string list) : Task<int> =
             return 0
     }
 
+/// Fill title / channel for videos queued before we stored metadata.
+/// Uses the public oEmbed endpoint: no cookies, no bot check, ~200 ms each.
+let private backfillTitlesCommand (args: string list) : Task<int> =
+    task {
+        Db.init Settings.connectionString
+        Db.migrate ()
+
+        let limit = intOf args "--limit" 0
+        let delay = intOf args "--delay" 150
+        let ids = Db.videosWithoutTitles limit
+
+        Console.WriteLine(sprintf "videos without title: %d" ids.Length)
+
+        let mutable ok = 0
+        let mutable failed = 0
+        let mutable i = 0
+
+        for id in ids do
+            i <- i + 1
+            let! res = YouTube.oembed id
+
+            match res with
+            | Ok(title, channel, channelUrl) ->
+                Db.setVideoMeta id title channel channelUrl
+                ok <- ok + 1
+            | Error reason ->
+                failed <- failed + 1
+                Console.WriteLine(sprintf "\n  %s: %s" id reason)
+
+            Console.Write(sprintf "\r[%d/%d] ok %d | failed %d | %s" i ids.Length ok failed id)
+            do! Http.delay delay
+
+        Console.WriteLine()
+        Console.WriteLine(sprintf "titles filled: %d, failed: %d" ok failed)
+        return 0
+    }
+
 let private hitsCommand (args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
@@ -285,12 +323,16 @@ let private hitsCommand (args: string list) : Task<int> =
         Console.WriteLine(sprintf "hits: %d" rows.Length)
 
         printTable
-            [ "url"; "at"; "d"; "term"; "title"; "snippet" ]
+            [ "url"; "at"; "d"; "term"; "channel"; "title"; "snippet" ]
             [ for r in rows ->
                   [ sprintf "https://www.youtube.com/watch?v=%s&t=%ds" r.video_id (r.t_start / 1000)
-                    sprintf "%d:%02d" (r.t_start / 60000) (r.t_start / 1000 % 60)
+                    sprintf "%d:%02d:%02d"
+                        (r.t_start / 3600000)
+                        (r.t_start / 60000 % 60)
+                        (r.t_start / 1000 % 60)
                     string r.depth
                     r.term
+                    r.channel
                     r.title
                     r.snippet ] ]
 
@@ -330,9 +372,10 @@ let private videosCommand (args: string list) : Task<int> =
         Console.WriteLine(sprintf "videos: %d" rows.Length)
 
         printTable
-            [ "url"; "title"; "state"; "dur"; "chars" ]
+            [ "url"; "channel"; "title"; "state"; "dur"; "chars" ]
             [ for r in rows ->
                   [ sprintf "https://www.youtube.com/watch?v=%s" r.id
+                    r.channel
                     r.title
                     r.state
                     string r.duration
@@ -486,6 +529,7 @@ let main argv =
         | "videos" -> videosCommand rest
         | "hits" -> hitsCommand rest
         | "backfill" -> backfillCommand rest
+        | "backfill-titles" -> backfillTitlesCommand rest
         | "requeue" -> requeueCommand rest
         | "sql" -> sqlCommand rest
         | "find" -> findCommand rest

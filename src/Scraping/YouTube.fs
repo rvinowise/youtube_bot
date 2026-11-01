@@ -316,6 +316,36 @@ let playlistItems (playlistId: string) (maxPages: int) : Task<(string * string) 
             return List.ofSeq items
     }
 
+// ---------------------------------------------------------------- oEmbed
+
+/// Title + channel for one video via the public oEmbed endpoint.
+///
+/// No cookies, no bot check, ~200 ms per call. Used to backfill titles for
+/// videos that were queued before we started storing metadata.
+let oembed (videoId: string) : Task<Result<string * string * string, string>> =
+    task {
+        let url =
+            sprintf "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=%s&format=json" videoId
+
+        let! body = Http.tryGetString url
+
+        match body with
+        | None -> return Error "oembed: no response (404 or network)"
+        | Some text ->
+            try
+                use doc = JsonDocument.Parse text
+                let root = doc.RootElement
+
+                let str (name: string) =
+                    match root.TryGetProperty name with
+                    | true, v when v.ValueKind = JsonValueKind.String -> v.GetString()
+                    | _ -> ""
+
+                return Ok(str "title", str "author_name", str "author_url")
+            with e ->
+                return Error e.Message
+    }
+
 // ---------------------------------------------------------------- thumbnails
 
 /// Download the best available still for a video into `destDir`.

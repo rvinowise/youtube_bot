@@ -145,6 +145,8 @@ create index if not exists frontier_queue_idx on frontier (topic_id, state, next
 create table if not exists video (
     id             text primary key,
     channel_id     text not null default '',
+    channel_name   text not null default '',
+    channel_url    text not null default '',
     title          text not null default '',
     duration       int  not null default 0,
     published      timestamptz null,
@@ -161,6 +163,8 @@ create table if not exists video (
 alter table video add column if not exists depth          int  not null default 0;
 alter table video add column if not exists parent_id      text null;
 alter table video add column if not exists discovered_via text not null default 'seed';
+alter table video add column if not exists channel_name   text not null default '';
+alter table video add column if not exists channel_url    text not null default '';
 
 create index if not exists video_state_idx   on video (state);
 create index if not exists video_channel_idx on video (channel_id);
@@ -398,20 +402,66 @@ set text = excluded.text, chars = excluded.chars, fetched_at = now()
         )
         |> ignore
 
-    let markVideoDone (videoId: string) (duration: int) (published: Nullable<DateTime>) =
+    let markVideoDone
+        (videoId: string)
+        (title: string)
+        (channelId: string)
+        (channelName: string)
+        (duration: int)
+        (published: Nullable<DateTime>)
+        =
         use conn = openConnection()
 
         conn.Execute(
             """
 update video set state = 'done', has_captions = true, attempts = attempts + 1,
-       last_error = null, duration = @duration, published = @published, updated_at = now()
+       last_error = null, duration = @duration, published = @published,
+       title = case when @title = '' then title else @title end,
+       channel_id = case when @channel_id = '' then channel_id else @channel_id end,
+       channel_name = case when @channel_name = '' then channel_name else @channel_name end,
+       channel_url = case when @channel_id = '' then channel_url
+                          else 'https://www.youtube.com/channel/' || @channel_id end,
+       updated_at = now()
 where id = @id
 """,
             {| duration = duration
                published = published
+               title = title
+               channel_id = channelId
+               channel_name = channelName
                id = videoId |}
         )
         |> ignore
+
+    /// Fill title / channel for a video we already know (oEmbed backfill).
+    let setVideoMeta (videoId: string) (title: string) (channelName: string) (channelUrl: string) =
+        use conn = openConnection()
+
+        conn.Execute(
+            """
+update video set title = @title, channel_name = @channel_name, channel_url = @channel_url,
+       updated_at = now()
+where id = @id
+""",
+            {| title = title
+               channel_name = channelName
+               channel_url = channelUrl
+               id = videoId |}
+        )
+        |> ignore
+
+    /// Videos still missing a title, shallowest first. `limit <= 0` = all of
+    /// them (`LIMIT 0` in Postgres would return nothing, hence the NULL).
+    let videosWithoutTitles (limit: int) : string list =
+        use conn = openConnection()
+
+        let lim = if limit <= 0 then Nullable<int>() else Nullable limit
+
+        conn.Query<string>(
+            "select id from video where title = '' order by depth, id limit @limit",
+            {| limit = lim |}
+        )
+        |> Seq.toList
 
     /// The transcript was fetched earlier by another topic (or an earlier run),
     /// so yt-dlp never saw this video now. Still move it out of `pending`.
@@ -427,17 +477,33 @@ where id = @id and state <> 'done'
         )
         |> ignore
 
-    let markVideoNoCaptions (videoId: string) (reason: string) (duration: int) =
+    let markVideoNoCaptions
+        (videoId: string)
+        (title: string)
+        (channelId: string)
+        (channelName: string)
+        (reason: string)
+        (duration: int)
+        =
         use conn = openConnection()
 
         conn.Execute(
             """
 update video set state = 'no_captions', has_captions = false, attempts = attempts + 1,
-       last_error = @err, duration = @duration, updated_at = now()
+       last_error = @err, duration = @duration,
+       title = case when @title = '' then title else @title end,
+       channel_id = case when @channel_id = '' then channel_id else @channel_id end,
+       channel_name = case when @channel_name = '' then channel_name else @channel_name end,
+       channel_url = case when @channel_id = '' then channel_url
+                          else 'https://www.youtube.com/channel/' || @channel_id end,
+       updated_at = now()
 where id = @id
 """,
             {| err = reason
                duration = duration
+               title = title
+               channel_id = channelId
+               channel_name = channelName
                id = videoId |}
         )
         |> ignore
@@ -508,6 +574,7 @@ on conflict (topic_id, video_id, term, t_start) do nothing
     type HitListRow =
         { video_id: string
           title: string
+          channel: string
           term: string
           t_start: int
           snippet: string
@@ -518,7 +585,7 @@ on conflict (topic_id, video_id, term, t_start) do nothing
 
         conn.Query<HitListRow>(
             """
-select h.video_id, v.title, h.term, h.t_start, h.snippet, v.depth
+select h.video_id, v.title, v.channel_name as channel, h.term, h.t_start, h.snippet, v.depth
 from hit h
 join video v on v.id = h.video_id
 join topic t on t.id = h.topic_id
@@ -536,6 +603,7 @@ limit @limit
     type VideoListRow =
         { id: string
           title: string
+          channel: string
           state: string
           duration: int
           chars: int
@@ -547,12 +615,12 @@ limit @limit
 
         conn.Query<VideoListRow>(
             """
-select v.id, v.title, v.state, v.duration, coalesce(t.chars, 0) as chars,
-       v.depth, v.discovered_via
+select v.id, v.title, v.channel_name as channel, v.state, v.duration,
+       coalesce(t.chars, 0) as chars, v.depth, v.discovered_via
 from video v
 left join transcript t on t.video_id = v.id
 where (@state = '' or v.state = @state)
-  and (@term = '' or v.title ilike @pattern)
+  and (@term = '' or v.title ilike @pattern or v.channel_name ilike @pattern)
 order by v.updated_at desc
 limit @limit
 """,

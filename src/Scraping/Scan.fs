@@ -162,10 +162,18 @@ module Scan =
                     match transcript with
                     | Ok segments ->
                         Db.saveTranscript videoId (Transcript.toText segments)
-                        Db.markVideoDone videoId m.Duration (parseUploadDate m.UploadDate)
+
+                        Db.markVideoDone
+                            videoId
+                            m.Title
+                            m.ChannelId
+                            m.ChannelName
+                            m.Duration
+                            (parseUploadDate m.UploadDate)
+
                         return Ok(Some segments)
                     | Error(NoCaptions reason) ->
-                        Db.markVideoNoCaptions videoId reason m.Duration
+                        Db.markVideoNoCaptions videoId m.Title m.ChannelId m.ChannelName reason m.Duration
                         return Error(NoCaptions reason)
                     | Error(Transient reason) -> return Error(Transient reason)
         }

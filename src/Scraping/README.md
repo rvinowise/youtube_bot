@@ -40,7 +40,8 @@ topic      a named set of terms, e.g. "immortality"
 frontier   the BFS queue, one per topic: (topic_id, video_id, depth, parent_id, state)
            queued -> running -> expanded | failed
 
-video      global visited set: every video ever seen, with depth and parent
+video      global visited set: every video ever seen, with depth, parent,
+           title, channel_name, channel_url
 transcript global cache: fetched once, reused by every topic
 hit        per topic: (topic_id, video_id, term, snippet, t_start)
 ```
@@ -58,6 +59,7 @@ per topic, so two topics explore independently.
 | `videos` | every visited video with URL, state, depth, transcript size |
 | `find` | ad-hoc search over the collected transcripts |
 | `backfill` | recompute hits for transcripts that have none |
+| `backfill-titles` | fill missing titles/channels via the public oEmbed endpoint |
 | `requeue` | put failed / caption-less videos of a topic back in the queue |
 | `sql` | run arbitrary SQL, print a table |
 | `db` | check the connection and apply the schema |
@@ -208,6 +210,30 @@ utils/yt-dlp.exe -4 --cookies-from-browser firefox --ignore-no-formats-error \
 `yt_dlp.extra_args` is a raw string appended to every yt-dlp call, so any flag
 works without a code change. `--cookies-from-browser` and
 `--ignore-no-formats-error` are always passed by [`YtDlp.fs`](YtDlp.fs).
+
+## Titles and channels
+
+`hits` and `videos` show the channel name next to the title, because a title
+alone does not tell you whether a video is a vlogger who mentioned immortality
+once or a generic popular-science channel:
+
+```
+url                                    at        d  term       channel            title
+https://youtu.be/vKQsrc4W9l4?t=7377    2:02:57   3  крионик    Сонный Ученый      ...
+```
+
+Titles come from `yt-dlp -J` at scan time. Videos queued before that was
+implemented are filled by `backfill-titles`, which uses YouTube's public oEmbed
+endpoint (`/oembed?url=...&format=json`) — no cookies, no bot check, ~200 ms per
+video, so ~8 000 videos take about 40 minutes:
+
+```bash
+dotnet run --project src/Scraping -- backfill-titles --delay 100
+```
+
+oEmbed returns `title`, `author_name` and `author_url` (a `@handle` URL, not a
+`UC...` id), so `channel_url` is stored as-is and `channel_id` stays empty for
+backfilled rows. Videos that are gone return 404 and are counted as failures.
 
 ## Asking another model for help
 
