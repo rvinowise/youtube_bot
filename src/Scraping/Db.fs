@@ -427,16 +427,21 @@ where topic_id = @topic and video_id = @video
         conn.Execute("delete from transcript_segment where video_id = @id", {| id = videoId |})
         |> ignore
 
-        segments
-        |> List.iteri (fun i (startMs, text) ->
+        if not segments.IsEmpty then
+            // One statement for the whole video: a per-segment INSERT meant
+            // thousands of round-trips and WAL records per video, which is what
+            // made the disk thrash.
             conn.Execute(
-                "insert into transcript_segment (video_id, idx, start_ms, text) values (@video, @idx, @start, @text)",
+                """
+insert into transcript_segment (video_id, idx, start_ms, text)
+select @video, ord - 1, start_ms, txt
+from unnest(@starts, @texts) with ordinality as t(start_ms, txt, ord)
+""",
                 {| video = videoId
-                   idx = i
-                   start = startMs
-                   text = text |}
+                   starts = segments |> List.map fst |> List.toArray
+                   texts = segments |> List.map snd |> List.toArray |}
             )
-            |> ignore)
+            |> ignore
 
     let getSegments (videoId: string) : (int * string) list =
         use conn = openConnection()

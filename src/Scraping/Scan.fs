@@ -280,7 +280,9 @@ module Scan =
 
                 match transcript with
                 | Ok segments ->
-                    Db.saveTranscript videoId (Transcript.toText segments)
+                    // The flat text is already stored and unchanged, so do not
+                    // rewrite it: only the segments (needed for timestamps) and
+                    // the hits are touched.
                     Db.saveSegments videoId (segments |> List.map (fun s -> s.StartMs, s.Text))
                     Db.deleteHitsForVideo topicId videoId
                     Db.insertHits topicId videoId (hitsFromSegments stems segments)

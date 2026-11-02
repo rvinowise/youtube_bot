@@ -30,65 +30,84 @@ type TranscriptError =
 /// body.
 module Transcript =
 
-    let private pick (tracks: CaptionTrack list) =
-        tracks
-        |> List.tryFind (fun t -> t.Ext = "json3")
-        |> Option.orElse (tracks |> List.tryFind (fun t -> t.Ext = "srv3"))
-        |> Option.orElse (List.tryHead tracks)
+    /// All usable tracks, best format first. YouTube often returns several
+    /// `json3` tracks for the same language and one of them can answer 429
+    /// while another works, so the caller must be able to fall through.
+    let private candidates (tracks: CaptionTrack list) =
+        let usable = tracks |> List.filter (fun t -> not (String.IsNullOrWhiteSpace t.Url))
+        let json3 = usable |> List.filter (fun t -> t.Ext = "json3")
+        let srv3 = usable |> List.filter (fun t -> t.Ext = "srv3")
+        let rest = usable |> List.filter (fun t -> t.Ext <> "json3" && t.Ext <> "srv3")
+        json3 @ srv3 @ rest
+
+    let private parse (body: string) : TranscriptSegment list =
+        use doc = JsonDocument.Parse body
+        let segments = ResizeArray<TranscriptSegment>()
+
+        match doc.RootElement.TryGetProperty "events" with
+        | true, events when events.ValueKind = JsonValueKind.Array ->
+            for ev in events.EnumerateArray() do
+                let startMs =
+                    match ev.TryGetProperty "tStartMs" with
+                    | true, v when v.ValueKind = JsonValueKind.Number ->
+                        match v.TryGetInt32() with
+                        | true, n -> n
+                        | _ -> 0
+                    | _ -> 0
+
+                let sb = StringBuilder()
+
+                match ev.TryGetProperty "segs" with
+                | true, segs when segs.ValueKind = JsonValueKind.Array ->
+                    for s in segs.EnumerateArray() do
+                        match s.TryGetProperty "utf8" with
+                        | true, v when v.ValueKind = JsonValueKind.String -> sb.Append(v.GetString()) |> ignore
+                        | _ -> ()
+                | _ -> ()
+
+                let text = sb.ToString().Trim()
+
+                if text <> "" then
+                    segments.Add { StartMs = startMs; Text = text }
+        | _ -> ()
+
+        List.ofSeq segments
 
     let fetch (tracks: CaptionTrack list) : Task<Result<TranscriptSegment list, TranscriptError>> =
         task {
-            match pick tracks with
-            | None -> return Error(NoCaptions "no caption tracks")
-            | Some t when String.IsNullOrWhiteSpace t.Url -> return Error(NoCaptions "empty caption url")
-            | Some t ->
-                let! response = Http.getStringStatus t.Url
+            let candidates = candidates tracks
 
-                match response with
-                | Error 429 -> return Error(Transient "429 Too Many Requests")
-                | Error code when code >= 500 -> return Error(Transient(sprintf "HTTP %d" code))
-                | Error code when code > 0 -> return Error(NoCaptions(sprintf "HTTP %d" code))
-                | Error _ -> return Error(Transient "network error")
-                | Ok body when String.IsNullOrWhiteSpace body -> return Error(NoCaptions "empty caption body")
-                | Ok body ->
-                    try
-                        use doc = JsonDocument.Parse body
-                        let segments = ResizeArray<TranscriptSegment>()
+            if candidates.IsEmpty then
+                return Error(NoCaptions "no caption tracks")
+            else
+                let mutable result = Error(NoCaptions "no usable caption track")
+                let mutable go = true
 
-                        match doc.RootElement.TryGetProperty "events" with
-                        | true, events when events.ValueKind = JsonValueKind.Array ->
-                            for ev in events.EnumerateArray() do
-                                let startMs =
-                                    match ev.TryGetProperty "tStartMs" with
-                                    | true, v when v.ValueKind = JsonValueKind.Number ->
-                                        match v.TryGetInt32() with
-                                        | true, n -> n
-                                        | _ -> 0
-                                    | _ -> 0
+                for t in candidates do
+                    if go then
+                        let! response = Http.getStringStatus t.Url
 
-                                let sb = StringBuilder()
+                        match response with
+                        | Error 429 ->
+                            // try the next track, remember that it was transient
+                            result <- Error(Transient "429 Too Many Requests")
+                        | Error code when code >= 500 -> result <- Error(Transient(sprintf "HTTP %d" code))
+                        | Error code when code > 0 -> result <- Error(NoCaptions(sprintf "HTTP %d" code))
+                        | Error _ -> result <- Error(Transient "network error")
+                        | Ok body when String.IsNullOrWhiteSpace body -> result <- Error(NoCaptions "empty caption body")
+                        | Ok body ->
+                            try
+                                let segments = parse body
 
-                                match ev.TryGetProperty "segs" with
-                                | true, segs when segs.ValueKind = JsonValueKind.Array ->
-                                    for s in segs.EnumerateArray() do
-                                        match s.TryGetProperty "utf8" with
-                                        | true, v when v.ValueKind = JsonValueKind.String ->
-                                            sb.Append(v.GetString()) |> ignore
-                                        | _ -> ()
-                                | _ -> ()
+                                if segments.IsEmpty then
+                                    result <- Error(NoCaptions "no segments")
+                                else
+                                    result <- Ok segments
+                                    go <- false
+                            with e ->
+                                result <- Error(NoCaptions e.Message)
 
-                                let text = sb.ToString().Trim()
-
-                                if text <> "" then
-                                    segments.Add { StartMs = startMs; Text = text }
-                        | _ -> ()
-
-                        if segments.Count = 0 then
-                            return Error(NoCaptions "no segments")
-                        else
-                            return Ok(List.ofSeq segments)
-                    with e ->
-                        return Error(NoCaptions e.Message)
+                return result
         }
 
     let toText (segments: TranscriptSegment list) =
