@@ -10,6 +10,8 @@ open Serilog
 type ScanOptions =
     { Topic: string
       Stems: string list
+      /// Words that disqualify a hit even when a needed term matched.
+      Exclude: string list
       SeedVideos: string list
       RelatedLimit: int
       /// 0 = no cap. Otherwise stop expanding a channel after N videos.
@@ -102,22 +104,22 @@ module Scan =
 
     // ------------------------------------------------------------ hits
 
-    let private hitsFromSegments (stems: string list) (segments: TranscriptSegment list) =
+    let private hitsFromSegments (stems: string list) (exclude: string list) (segments: TranscriptSegment list) =
         [ for term in stems do
               match
                   segments
                   |> List.tryFind (fun s -> HitTerms.matches (s.Text.ToLowerInvariant()) term)
               with
-              | Some seg ->
+              | Some seg when not (HitTerms.matchesAny (seg.Text.ToLowerInvariant()) exclude) ->
                   let low = seg.Text.ToLowerInvariant()
                   let idx = HitTerms.firstIndex low term
                   let start = max 0 (idx - 80)
                   let len = min (seg.Text.Length - start) 220
                   yield term, seg.Text.Substring(start, len), seg.StartMs
-              | None -> () ]
+              | _ -> () ]
 
     /// Same, but over a flat transcript where timestamps are gone.
-    let hitsFromText (stems: string list) (text: string) =
+    let hitsFromText (stems: string list) (exclude: string list) (text: string) =
         let low = text.ToLowerInvariant()
 
         [ for term in stems do
@@ -125,7 +127,10 @@ module Scan =
                   let idx = HitTerms.firstIndex low term
                   let start = max 0 (idx - 80)
                   let len = min (text.Length - start) 220
-                  yield term, text.Substring(start, len), 0 ]
+                  let snippet = text.Substring(start, len)
+
+                  if not (HitTerms.matchesAny (snippet.ToLowerInvariant()) exclude) then
+                      yield term, snippet, 0 ]
 
     // ------------------------------------------------------------ one video
 
@@ -189,7 +194,14 @@ module Scan =
                     | Error(Transient reason) -> return Error(Transient reason)
         }
 
-    let private processItem (exe: string) (topicId: int64) (stems: string list) (options: ScanOptions) (item: Frontier_row) =
+    let private processItem
+        (exe: string)
+        (topicName: string)
+        (stems: string list)
+        (exclude: string list)
+        (options: ScanOptions)
+        (item: Frontier_row)
+        =
         task {
             counters.Current <- sprintf "d%d %s" item.depth item.video_id
             counters.Depth <- item.depth
@@ -201,18 +213,18 @@ module Scan =
                 match transcript with
                 | Ok(Some segments) ->
                     counters.Captions <- counters.Captions + 1
-                    hitsFromSegments stems segments
+                    hitsFromSegments stems exclude segments
                 | Ok None ->
                     let stored = Db.getTranscript item.video_id
 
-                    if isNull (box stored) then [] else hitsFromText stems stored.text
+                    if isNull (box stored) then [] else hitsFromText stems exclude stored.text
                 | Error(NoCaptions _) ->
                     counters.NoCaptions <- counters.NoCaptions + 1
                     []
                 | Error(Transient _) -> []
 
             if not hits.IsEmpty then
-                Db.insertHits topicId item.video_id hits
+                Db.insertHits topicName item.video_id hits
                 counters.Hits <- counters.Hits + hits.Length
 
                 Log.Information(
@@ -230,7 +242,7 @@ module Scan =
             let capped =
                 options.MaxPerChannel > 0
                 && channel <> ""
-                && Db.channelExpandedCount topicId channel >= options.MaxPerChannel
+                && Db.channelExpandedCount topicName channel >= options.MaxPerChannel
 
             // Expand regardless of the transcript outcome: a video without
             // captions is still a node in the recommendation graph, and the
@@ -248,15 +260,15 @@ module Scan =
             let childPriority = item.priority + float hits.Length
 
             for (id, _title) in related do
-                Db.enqueue topicId id (item.depth + 1) item.video_id "related" childPriority
+                Db.enqueue topicName id (item.depth + 1) item.video_id "related" childPriority Settings.node
 
             match transcript with
             | Error(Transient reason) ->
                 counters.Failed <- counters.Failed + 1
-                Db.markFrontierRetry topicId item.video_id item.attempts
+                Db.markFrontierRetry topicName item.video_id item.attempts
                 Log.Warning("transient: {Video} depth {Depth} — {Reason}", item.video_id, item.depth, reason)
             | _ ->
-                Db.markExpanded topicId item.video_id
+                Db.markExpanded topicName item.video_id
 
                 Log.Information(
                     "expanded: {Video} depth {Depth} -> {Related} related",
@@ -269,7 +281,13 @@ module Scan =
     /// Re-fetch the captions of one video and recompute its hits, so the rows
     /// get real timestamps. Used by `recheck` after hits were scored from a
     /// flat, timestamp-less transcript.
-    let refreshVideo (exe: string) (topicId: int64) (stems: string list) (videoId: string) : Task<bool> =
+    let refreshVideo
+        (exe: string)
+        (topicName: string)
+        (stems: string list)
+        (exclude: string list)
+        (videoId: string)
+        : Task<bool> =
         task {
             let! meta = YtDlp.fetchMeta exe videoId
 
@@ -284,8 +302,8 @@ module Scan =
                     // rewrite it: only the segments (needed for timestamps) and
                     // the hits are touched.
                     Db.saveSegments videoId (segments |> List.map (fun s -> s.StartMs, s.Text))
-                    Db.deleteHitsForVideo topicId videoId
-                    Db.insertHits topicId videoId (hitsFromSegments stems segments)
+                    Db.deleteHitsForVideo topicName videoId
+                    Db.insertHits topicName videoId (hitsFromSegments stems exclude segments)
                     return true
                 | Error _ -> return false
         }
@@ -297,24 +315,26 @@ module Scan =
             counters.StartedAt <- DateTime.UtcNow
             counters.Topic <- options.Topic
 
-            let topicId = Db.ensureTopic options.Topic options.Stems
-            let stems = Db.topicStems topicId
+            let topicName = Db.ensureTopic options.Topic options.Stems
+            let stems = Db.topicStems topicName
+            let exclude = Db.topicExclude topicName
 
             Log.Information(
-                "topic {Topic} (id {Id}), terms: {Stems}",
-                options.Topic,
-                topicId,
-                String.concat ", " stems
+                "topic {Topic}, node {Node}, terms: {Stems}, exclude: {Exclude}",
+                topicName,
+                Settings.node,
+                String.concat ", " stems,
+                String.concat ", " exclude
             )
 
             // crash recovery: whatever was mid-flight goes back to the queue
-            Db.resetRunning topicId
+            Db.resetRunning topicName
 
             for videoId in options.SeedVideos do
-                Db.enqueue topicId videoId 0 null "seed" 0.0
+                Db.enqueue topicName videoId 0 null "seed" 0.0 Settings.node
                 Log.Information("seed: {Video}", videoId)
 
-            counters.Queued <- Db.queuedCount topicId
+            counters.Queued <- Db.queuedCount topicName
             Console.WriteLine(sprintf "topic: %s | queued: %d" options.Topic counters.Queued)
 
             let exe = YtDlp.resolvePath Settings.ytDlpPath
@@ -323,13 +343,13 @@ module Scan =
             let mutable consecutiveFailures = 0
 
             while go && (options.Limit <= 0 || counters.Expanded < options.Limit) do
-                let item = Db.claimFrontier topicId
+                let item = Db.claimFrontier topicName
 
                 if isNull (box item) then
                     // Everything queued is waiting out its backoff. Keep the
                     // process alive for a while instead of reporting "done",
                     // but do not spin forever if the queue is stuck.
-                    let queued = Db.queuedCount topicId
+                    let queued = Db.queuedCount topicName
 
                     if queued > 0 && idleRounds < 60 then
                         idleRounds <- idleRounds + 1
@@ -343,9 +363,9 @@ module Scan =
                 else
                     idleRounds <- 0
                     let failedBefore = counters.Failed
-                    do! processItem exe topicId stems options item
+                    do! processItem exe topicName stems exclude options item
                     counters.Expanded <- counters.Expanded + 1
-                    counters.Queued <- Db.queuedCount topicId
+                    counters.Queued <- Db.queuedCount topicName
                     render ()
                     heartbeat ()
 

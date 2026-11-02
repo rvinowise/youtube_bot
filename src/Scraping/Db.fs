@@ -17,13 +17,12 @@ type Topic_table() =
 
 [<CLIMutable>]
 type Topic_row =
-    { id: int64
-      name: string
-      stems: string[] }
+    { name: string
+      stems: string[]  }
 
 type Frontier_table() =
     override _.ToString() = "frontier"
-    member _.topic_id = "topic_id"
+    member _.topic_name = "topic_name"
     member _.video_id = "video_id"
     member _.depth = "depth"
     member _.parent_id = "parent_id"
@@ -32,7 +31,7 @@ type Frontier_table() =
 
 [<CLIMutable>]
 type Frontier_row =
-    { topic_id: int64
+    { topic_name: string
       video_id: string
       depth: int
       parent_id: string
@@ -88,7 +87,7 @@ type Transcript_row =
 
 type Hit_table() =
     override _.ToString() = "hit"
-    member _.topic_id = "topic_id"
+    member _.topic_name = "topic_name"
     member _.video_id = "video_id"
     member _.term = "term"
     member _.snippet = "snippet"
@@ -97,7 +96,7 @@ type Hit_table() =
 
 [<CLIMutable>]
 type Hit_row =
-    { topic_id: int64
+    { topic_name: string
       video_id: string
       term: string
       snippet: string
@@ -120,30 +119,16 @@ module Db =
 
     let private ddl =
         """
+-- The topic NAME is the natural key: it is what pages merge on, so every
+-- child table references it instead of a local serial.
 create table if not exists topic (
-    id         bigserial primary key,
-    name       text not null unique,
+    name       text primary key,
     stems      text[] not null,
+    exclude    text[] not null default '{}',
     created_at timestamptz not null default now()
 );
 
-create table if not exists frontier (
-    topic_id  bigint not null references topic(id) on delete cascade,
-    video_id  text not null,
-    depth     int  not null default 0,
-    parent_id text null,
-    state     text not null default 'queued',
-    attempts  int  not null default 0,
-    added_at  timestamptz not null default now(),
-    next_attempt_at timestamptz not null default now(),
-    priority  real not null default 0,
-    primary key (topic_id, video_id)
-);
-
-alter table frontier add column if not exists next_attempt_at timestamptz not null default now();
-alter table frontier add column if not exists priority real not null default 0;
-
-create index if not exists frontier_queue_idx on frontier (topic_id, state, priority, next_attempt_at);
+alter table topic add column if not exists exclude text[] not null default '{}';
 
 create table if not exists video (
     id             text primary key,
@@ -160,6 +145,7 @@ create table if not exists video (
     depth          int  not null default 0,
     parent_id      text null,
     discovered_via text not null default 'seed',
+    origin         text not null default '',
     updated_at     timestamptz not null default now()
 );
 
@@ -169,9 +155,46 @@ alter table video add column if not exists discovered_via text not null default 
 alter table video add column if not exists channel_name   text not null default '';
 alter table video add column if not exists channel_url    text not null default '';
 alter table video add column if not exists channel_followers int not null default 0;
+alter table video add column if not exists origin         text not null default '';
 
 create index if not exists video_state_idx   on video (state);
 create index if not exists video_channel_idx on video (channel_id);
+
+create table if not exists frontier (
+    topic_name text not null references topic(name) on delete cascade,
+    video_id  text not null,
+    depth     int  not null default 0,
+    parent_id text null,
+    state     text not null default 'queued',
+    attempts  int  not null default 0,
+    added_at  timestamptz not null default now(),
+    next_attempt_at timestamptz not null default now(),
+    priority  real not null default 0,
+    primary key (topic_name, video_id)
+);
+
+alter table frontier add column if not exists next_attempt_at timestamptz not null default now();
+alter table frontier add column if not exists priority real not null default 0;
+
+-- v0.6 -> v0.7: frontier switches from a local topic_id to the topic name.
+do $$
+begin
+    if exists (select 1 from information_schema.columns
+               where table_name = 'frontier' and column_name = 'topic_id') then
+        alter table frontier add column if not exists topic_name text;
+        update frontier f set topic_name = t.name
+          from topic t where t.id = f.topic_id and f.topic_name is null;
+        alter table frontier alter column topic_name set not null;
+        alter table frontier drop constraint if exists frontier_pkey;
+        alter table frontier drop constraint if exists frontier_topic_id_fkey;
+        alter table frontier drop column topic_id;
+        alter table frontier add primary key (topic_name, video_id);
+        alter table frontier add constraint frontier_topic_name_fkey
+          foreign key (topic_name) references topic(name) on delete cascade;
+    end if;
+end $$;
+
+create index if not exists frontier_queue_idx on frontier (topic_name, state, priority, next_attempt_at);
 
 create table if not exists transcript_segment (
     video_id text not null references video(id) on delete cascade,
@@ -193,25 +216,56 @@ create table if not exists transcript (
 -- v0.1 had a topic-less hit table; it is derived data, so drop and recreate.
 do $$
 begin
-    if exists (
-        select 1 from information_schema.columns
-        where table_name = 'hit' and column_name = 'id'
-    ) then
+    if exists (select 1 from information_schema.columns
+               where table_name = 'hit' and column_name = 'id') then
         drop table hit;
     end if;
 end $$;
 
 create table if not exists hit (
-    topic_id bigint not null references topic(id) on delete cascade,
-    video_id text   not null references video(id) on delete cascade,
-    term     text   not null,
-    snippet  text   not null default '',
-    t_start  int    not null default 0,
-    score    real   not null default 0,
-    unique (topic_id, video_id, term, t_start)
+    topic_name text   not null references topic(name) on delete cascade,
+    video_id   text   not null references video(id) on delete cascade,
+    term       text   not null,
+    snippet    text   not null default '',
+    t_start    int    not null default 0,
+    score      real   not null default 0,
+    unique (topic_name, video_id, term, t_start)
 );
 
-create index if not exists hit_topic_idx on hit (topic_id, term);
+-- v0.6 -> v0.7: hit switches from topic_id to topic name.
+do $$
+begin
+    if exists (select 1 from information_schema.columns
+               where table_name = 'hit' and column_name = 'topic_id') then
+        create table hit_v7 (
+            topic_name text not null references topic(name) on delete cascade,
+            video_id   text not null references video(id) on delete cascade,
+            term       text not null,
+            snippet    text not null default '',
+            t_start    int  not null default 0,
+            score      real not null default 0,
+            unique (topic_name, video_id, term, t_start)
+        );
+        insert into hit_v7 (topic_name, video_id, term, snippet, t_start, score)
+          select t.name, h.video_id, h.term, h.snippet, h.t_start, h.score
+          from hit h join topic t on t.id = h.topic_id;
+        drop table hit;
+        alter table hit_v7 rename to hit;
+    end if;
+end $$;
+
+create index if not exists hit_topic_idx on hit (topic_name, term);
+
+-- Only after both children stopped referencing topic.id can it go away.
+do $$
+begin
+    if exists (select 1 from information_schema.columns
+               where table_name = 'topic' and column_name = 'id') then
+        alter table topic drop constraint if exists topic_pkey;
+        alter table topic add primary key (name);
+        alter table topic drop column id;
+    end if;
+end $$;
 """
 
     /// Idempotent DDL. Safe to call on every start.
@@ -221,9 +275,9 @@ create index if not exists hit_topic_idx on hit (topic_id, term);
 
     // ------------------------------------------------------------ topics
 
-    /// Create the topic if missing, return its id. Stems are only written on
-    /// creation, so an existing topic keeps its vocabulary.
-    let ensureTopic (name: string) (stems: string list) : int64 =
+    /// Create the topic if missing, return its name (the natural key). Stems are
+    /// only written on creation, so an existing topic keeps its vocabulary.
+    let ensureTopic (name: string) (stems: string list) : string =
         use conn = openConnection()
 
         conn.Execute(
@@ -232,36 +286,52 @@ create index if not exists hit_topic_idx on hit (topic_id, term);
         )
         |> ignore
 
-        conn.ExecuteScalar<int64>("select id from topic where name = @name", {| name = name |})
+        name
 
-    let topicIdByName (name: string) : int64 option =
+    let topicExists (name: string) : bool =
         use conn = openConnection()
 
-        match conn.ExecuteScalar<Nullable<int64>>("select id from topic where name = @name", {| name = name |}) with
-        | n when n.HasValue -> Some n.Value
-        | _ -> None
+        conn.ExecuteScalar<int64>("select count(*) from topic where name = @name", {| name = name |}) > 0L
 
     /// Replace the vocabulary of an existing topic (used when `--stems` is
     /// passed explicitly: without this, the stems of an existing topic were
     /// silently ignored).
-    let setTopicStems (topicId: int64) (stems: string list) =
+    let setTopicStems (name: string) (stems: string list) =
         use conn = openConnection()
 
         conn.Execute(
-            "update topic set stems = @stems where id = @id",
-            {| id = topicId; stems = List.toArray stems |}
+            "update topic set stems = @stems where name = @name",
+            {| name = name; stems = List.toArray stems |}
         )
         |> ignore
 
-    let topicStems (topicId: int64) : string list =
+    /// Words that disqualify a hit even when a needed term matched.
+    let setTopicExclude (name: string) (exclude: string list) =
         use conn = openConnection()
 
-        conn.ExecuteScalar<string[]>("select stems from topic where id = @id", {| id = topicId |})
+        conn.Execute(
+            "update topic set exclude = @exclude where name = @name",
+            {| name = name; exclude = List.toArray exclude |}
+        )
+        |> ignore
+
+    let topicStems (name: string) : string list =
+        use conn = openConnection()
+
+        conn.ExecuteScalar<string[]>("select stems from topic where name = @name", {| name = name |})
+        |> List.ofArray
+
+    let topicExclude (name: string) : string list =
+        use conn = openConnection()
+
+        conn.ExecuteScalar<string[]>(
+            "select coalesce(exclude, '{}') from topic where name = @name",
+            {| name = name |}
+        )
         |> List.ofArray
 
     type TopicStat =
-        { id: int64
-          name: string
+        { name: string
           stems: string
           queued: int64
           expanded: int64
@@ -273,17 +343,16 @@ create index if not exists hit_topic_idx on hit (topic_id, term);
 
         conn.Query<TopicStat>(
             """
-select t.id,
-       t.name,
+select t.name,
        array_to_string(t.stems, ', ') as stems,
-       (select count(*) from frontier f where f.topic_id = t.id and f.state = 'queued')   as queued,
-       (select count(*) from frontier f where f.topic_id = t.id and f.state = 'expanded') as expanded,
+       (select count(*) from frontier f where f.topic_name = t.name and f.state = 'queued')   as queued,
+       (select count(*) from frontier f where f.topic_name = t.name and f.state = 'expanded') as expanded,
        (select count(*) from video v
-          join frontier f2 on f2.video_id = v.id and f2.topic_id = t.id
-         where v.state = 'done')                                                          as videos,
-       (select count(*) from hit h where h.topic_id = t.id)                               as hits
+          join frontier f2 on f2.video_id = v.id and f2.topic_name = t.name
+         where v.state = 'done')                                                               as videos,
+       (select count(*) from hit h where h.topic_name = t.name)                                as hits
 from topic t
-order by t.id
+order by t.name
 """
         )
         |> Seq.toList
@@ -291,43 +360,54 @@ order by t.id
     // ------------------------------------------------------------ frontier
 
     /// Crash recovery: anything left `running` goes back to the queue.
-    let resetRunning (topicId: int64) =
+    let resetRunning (topicName: string) =
         use conn = openConnection()
 
         conn.Execute(
-            "update frontier set state = 'queued', next_attempt_at = now() where topic_id = @topic and state = 'running'",
-            {| topic = topicId |}
+            "update frontier set state = 'queued', next_attempt_at = now() where topic_name = @topic and state = 'running'",
+            {| topic = topicName |}
         )
         |> ignore
 
     /// Add a video to the topic's queue. Idempotent.
     ///
     /// `priority` is inherited from the parent and bumped by the parent's own
-    /// hits, so the crawl follows the thread that is paying off.
-    let enqueue (topicId: int64) (videoId: string) (depth: int) (parentId: string) (via: string) (priority: float) =
+    /// hits, so the crawl follows the thread that is paying off. `origin` is
+    /// the node that discovered the video — it survives a merge, so you can
+    /// still tell which machine (and which seed) found a lead.
+    let enqueue
+        (topicName: string)
+        (videoId: string)
+        (depth: int)
+        (parentId: string)
+        (via: string)
+        (priority: float)
+        (origin: string)
+        =
         use conn = openConnection()
 
         conn.Execute(
             """
-insert into video (id, depth, parent_id, discovered_via)
-values (@id, @depth, @parent, @via)
+insert into video (id, depth, parent_id, discovered_via, origin)
+values (@id, @depth, @parent, @via, @origin)
 on conflict (id) do nothing
 """,
             {| id = videoId
                depth = depth
                parent = (if isNull parentId then null else box parentId)
-               via = via |}
+               via = via
+               origin = origin |}
         )
         |> ignore
 
         conn.Execute(
             """
-insert into frontier (topic_id, video_id, depth, parent_id, priority)
+insert into frontier (topic_name, video_id, depth, parent_id, priority)
 values (@topic, @video, @depth, @parent, @priority)
-on conflict (topic_id, video_id) do update
+on conflict (topic_name, video_id) do update
 set priority = greatest(frontier.priority, excluded.priority)
 """,
-            {| topic = topicId
+            {| topic = topicName
                video = videoId
                depth = depth
                parent = (if isNull parentId then null else box parentId)
@@ -340,38 +420,38 @@ set priority = greatest(frontier.priority, excluded.priority)
     /// Best-first: `priority` is accumulated down the tree from the seeds, so a
     /// video whose parent mentioned the topic is expanded long before an
     /// equally shallow video from an unrelated neighbourhood.
-    let claimFrontier (topicId: int64) : Frontier_row =
+    let claimFrontier (topicName: string) : Frontier_row =
         use conn = openConnection()
 
         conn.QuerySingleOrDefault<Frontier_row>(
             """
 update frontier set state = 'running', attempts = attempts + 1
-where (topic_id, video_id) = (
-    select topic_id, video_id
+where (topic_name, video_id) = (
+    select topic_name, video_id
     from frontier
-    where topic_id = @topic and state = 'queued' and next_attempt_at <= now()
+    where topic_name = @topic and state = 'queued' and next_attempt_at <= now()
     order by priority desc, depth, next_attempt_at
     limit 1
     for update skip locked
 )
-returning topic_id, video_id, depth, parent_id, state, attempts, priority
+returning topic_name, video_id, depth, parent_id, state, attempts, priority
 """,
-            {| topic = topicId |}
+            {| topic = topicName |}
         )
 
-    let markExpanded (topicId: int64) (videoId: string) =
+    let markExpanded (topicName: string) (videoId: string) =
         use conn = openConnection()
 
         conn.Execute(
-            "update frontier set state = 'expanded' where topic_id = @topic and video_id = @video",
-            {| topic = topicId; video = videoId |}
+            "update frontier set state = 'expanded' where topic_name = @topic and video_id = @video",
+            {| topic = topicName; video = videoId |}
         )
         |> ignore
 
     /// After a transient failure: retry with exponential backoff, give up after
     /// 5 attempts. The backoff matters: a 429 would otherwise be retried at
     /// once, burn the attempt budget and mark a perfectly good video `failed`.
-    let markFrontierRetry (topicId: int64) (videoId: string) (attempts: int) =
+    let markFrontierRetry (topicName: string) (videoId: string) (attempts: int) =
         use conn = openConnection()
 
         let state = if attempts >= 5 then "failed" else "queued"
@@ -382,30 +462,30 @@ returning topic_id, video_id, depth, parent_id, state, attempts, priority
 update frontier
 set state = @state,
     next_attempt_at = now() + make_interval(secs => @delay)
-where topic_id = @topic and video_id = @video
+where topic_name = @topic and video_id = @video
 """,
             {| state = state
                delay = delaySeconds
-               topic = topicId
+               topic = topicName
                video = videoId |}
         )
         |> ignore
 
-    let markFrontierFailed (topicId: int64) (videoId: string) =
+    let markFrontierFailed (topicName: string) (videoId: string) =
         use conn = openConnection()
 
         conn.Execute(
-            "update frontier set state = 'failed' where topic_id = @topic and video_id = @video",
-            {| topic = topicId; video = videoId |}
+            "update frontier set state = 'failed' where topic_name = @topic and video_id = @video",
+            {| topic = topicName; video = videoId |}
         )
         |> ignore
 
-    let queuedCount (topicId: int64) : int =
+    let queuedCount (topicName: string) : int =
         use conn = openConnection()
 
         conn.ExecuteScalar<int64>(
-            "select count(*) from frontier where topic_id = @topic and state = 'queued'",
-            {| topic = topicId |}
+            "select count(*) from frontier where topic_name = @topic and state = 'queued'",
+            {| topic = topicName |}
         )
         |> int
 
@@ -453,7 +533,7 @@ from unnest(@starts, @texts) with ordinality as t(start_ms, txt, ord)
         |> Seq.toList
 
     /// Videos of the topic whose hits have no timestamp (scored from flat text).
-    let videosWithUntimedHits (topicId: int64) (limit: int) : string list =
+    let videosWithUntimedHits (topicName: string) (limit: int) : string list =
         use conn = openConnection()
 
         let lim = if limit <= 0 then Nullable<int>() else Nullable limit
@@ -462,19 +542,19 @@ from unnest(@starts, @texts) with ordinality as t(start_ms, txt, ord)
             """
 select distinct h.video_id
 from hit h
-where h.topic_id = @topic and h.t_start = 0
+where h.topic_name = @topic and h.t_start = 0
 limit @limit
 """,
-            {| topic = topicId; limit = lim |}
+            {| topic = topicName; limit = lim |}
         )
         |> Seq.toList
 
-    let deleteHitsForVideo (topicId: int64) (videoId: string) =
+    let deleteHitsForVideo (topicName: string) (videoId: string) =
         use conn = openConnection()
 
         conn.Execute(
-            "delete from hit where topic_id = @topic and video_id = @video",
-            {| topic = topicId; video = videoId |}
+            "delete from hit where topic_name = @topic and video_id = @video",
+            {| topic = topicName; video = videoId |}
         )
         |> ignore
 
@@ -586,7 +666,7 @@ limit @limit
         )
 
     /// How many videos of this channel the topic has already expanded.
-    let channelExpandedCount (topicId: int64) (channel: string) : int =
+    let channelExpandedCount (topicName: string) (channel: string) : int =
         use conn = openConnection()
 
         conn.ExecuteScalar<int64>(
@@ -594,9 +674,9 @@ limit @limit
 select count(*)
 from frontier f
 join video v on v.id = f.video_id
-where f.topic_id = @topic and f.state = 'expanded' and v.channel_name = @channel
+where f.topic_name = @topic and f.state = 'expanded' and v.channel_name = @channel
 """,
-            {| topic = topicId; channel = channel |}
+            {| topic = topicName; channel = channel |}
         )
         |> int
 
@@ -664,10 +744,10 @@ where id = @id
     /// Delete every hit of a topic, so `backfill` can recompute them after the
     /// vocabulary changed. Nothing else is touched: the frontier and the video
     /// table are history, not a match set.
-    let clearHits (topicId: int64) : int =
+    let clearHits (topicName: string) : int =
         use conn = openConnection()
 
-        conn.Execute("delete from hit where topic_id = @topic", {| topic = topicId |})
+        conn.Execute("delete from hit where topic_name = @topic", {| topic = topicName |})
 
     let markVideoFailed (videoId: string) (reason: string) =
         use conn = openConnection()
@@ -684,7 +764,7 @@ where id = @id
     /// Put every failed item of a topic back in the queue and clear the retry
     /// counters. Needed after the YouTube bot check or a transient outage --
     /// otherwise those videos stay failed forever.
-    let requeueFailed (topicId: int64) (alsoNoCaptions: bool) : int =
+    let requeueFailed (topicName: string) (alsoNoCaptions: bool) : int =
         use conn = openConnection()
 
         let states = if alsoNoCaptions then [ "failed"; "no_captions" ] else [ "failed" ]
@@ -693,18 +773,18 @@ where id = @id
             conn.Execute(
                 """
 update frontier set state = 'queued', attempts = 0, next_attempt_at = now()
-where topic_id = @topic and state = any(@states)
+where topic_name = @topic and state = any(@states)
 """,
-                {| topic = topicId; states = List.toArray states |}
+                {| topic = topicName; states = List.toArray states |}
             )
 
         conn.Execute(
             """
 update video v set attempts = 0, last_error = null, state = 'pending', updated_at = now()
 where v.state in ('failed', 'no_captions')
-  and exists (select 1 from frontier f where f.video_id = v.id and f.topic_id = @topic and f.state = 'queued')
+  and exists (select 1 from frontier f where f.video_id = v.id and f.topic_name = @topic and f.state = 'queued')
 """,
-            {| topic = topicId |}
+            {| topic = topicName |}
         )
         |> ignore
 
@@ -713,18 +793,18 @@ where v.state in ('failed', 'no_captions')
     // ------------------------------------------------------------ hits
 
     /// Insert the hits of one video for one topic. Idempotent.
-    let insertHits (topicId: int64) (videoId: string) (hits: (string * string * int) list) =
+    let insertHits (topicName: string) (videoId: string) (hits: (string * string * int) list) =
         if not hits.IsEmpty then
             use conn = openConnection()
 
             for (term, snippet, startMs) in hits do
                 conn.Execute(
                     """
-insert into hit (topic_id, video_id, term, snippet, t_start, score)
+insert into hit (topic_name, video_id, term, snippet, t_start, score)
 values (@topic, @video, @term, @snippet, @t_start, 1)
-on conflict (topic_id, video_id, term, t_start) do nothing
+on conflict (topic_name, video_id, term, t_start) do nothing
 """,
-                    {| topic = topicId
+                    {| topic = topicName
                        video = videoId
                        term = term
                        snippet = snippet
@@ -749,8 +829,7 @@ on conflict (topic_id, video_id, term, t_start) do nothing
 select h.video_id, v.title, v.channel_name as channel, h.term, h.t_start, h.snippet, v.depth
 from hit h
 join video v on v.id = h.video_id
-join topic t on t.id = h.topic_id
-where (@topic = '' or t.name = @topic)
+where (@topic = '' or h.topic_name = @topic)
   and (@term = '' or h.term = @term)
 order by v.depth, h.t_start
 limit @limit
@@ -792,40 +871,51 @@ limit @limit
         )
         |> Seq.toList
 
+    [<CLIMutable>]
     type ChannelRow =
         { channel: string
           url: string
           subs: int64
           videos: int64
+          videos_total: int64
           mentions: int64
           depth: int
           sample: string }
 
     /// Hits grouped by channel: the point is to find *people*, not videos.
-    /// A channel with 3 mentions in 3 different videos is a much better lead
-    /// than a factory channel with 1 mention in 1 video. `maxSubs > 0` keeps
-    /// only channels small enough to still be "a beginner blogger".
-    let listChannels (topicName: string) (term: string) (limit: int) (maxSubs: int) =
+    /// `maxSubs > 0` keeps only channels small enough to still be "a beginner
+    /// blogger". `sortBy` = "mentions" (default) or "surprise": the latter
+    /// ranks by how RARE the mention is inside the channel's own body of work —
+    /// 1 mention in 200 videos is a much better lead than 3 in 3.
+    let listChannels (topicName: string) (term: string) (limit: int) (maxSubs: int) (sortBy: string) =
         use conn = openConnection()
 
+        let order =
+            if sortBy = "surprise" then
+                "(count(*)::numeric / greatest(max(vt.videos_total), 1)), count(*) desc"
+            else
+                "count(*) desc, count(distinct h.video_id) desc"
+
         conn.Query<ChannelRow>(
-            """
+            $"""
 select v.channel_name as channel,
        coalesce((array_agg(distinct v.channel_url))[1], '') as url,
        max(v.channel_followers) as subs,
        count(distinct h.video_id) as videos,
+       max(vt.videos_total) as videos_total,
        count(*) as mentions,
        min(v.depth) as depth,
        (array_agg(v.title order by v.depth))[1] as sample
 from hit h
 join video v on v.id = h.video_id
-join topic t on t.id = h.topic_id
-where (@topic = '' or t.name = @topic)
+left join (select channel_name, count(*) as videos_total from video group by channel_name) vt
+       on vt.channel_name = v.channel_name
+where (@topic = '' or h.topic_name = @topic)
   and (@term = '' or h.term = @term)
   and v.channel_name <> ''
 group by v.channel_name
 having (@max_subs <= 0 or max(v.channel_followers) <= @max_subs)
-order by mentions desc, videos desc
+order by {order}
 limit @limit
 """,
             {| topic = topicName
@@ -861,17 +951,17 @@ limit @limit
         |> Seq.toList
 
     /// Transcripts of this topic that have no hits yet (for `backfill`).
-    let transcriptsWithoutHits (topicId: int64) =
+    let transcriptsWithoutHits (topicName: string) =
         use conn = openConnection()
 
         conn.Query<Transcript_row>(
             """
 select t.video_id, t.lang, t.source, t.text, t.chars
 from transcript t
-join frontier f on f.video_id = t.video_id and f.topic_id = @topic
-where not exists (select 1 from hit h where h.video_id = t.video_id and h.topic_id = @topic)
+join frontier f on f.video_id = t.video_id and f.topic_name = @topic
+where not exists (select 1 from hit h where h.video_id = t.video_id and h.topic_name = @topic)
 """,
-            {| topic = topicId |}
+            {| topic = topicName |}
         )
         |> Seq.toList
 

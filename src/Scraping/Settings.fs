@@ -37,6 +37,12 @@ module Settings =
     let workDir =
         configuration.GetValue<string>("work_dir", "work")
 
+    /// Name of this scraping node, stored on every video it discovers. Several
+    /// machines can scrape into separate databases and be merged later; this is
+    /// what keeps "which machine found this" answerable after the merge.
+    let node =
+        configuration.GetValue<string>("node", Environment.MachineName)
+
     let logPath = Path.Combine(workDir, "scraping.log")
 
     let initLogging () =

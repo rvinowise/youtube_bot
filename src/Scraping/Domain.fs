@@ -138,6 +138,15 @@ module HitTerms =
         let m = (regex term).Match text
         if m.Success then m.Index else 0
 
+    /// True when any of the excluded terms matches. Used to drop hits that are
+    /// technically on-topic but sit in a context we do not want (religion,
+    /// conspiracy, ...): excluded words are the same kind of `+`-joined
+    /// word-boundary patterns as the needed ones.
+    let matchesAny (text: string) (terms: string list) =
+        not (System.String.IsNullOrEmpty text)
+        && not terms.IsEmpty
+        && terms |> List.exists (fun t -> (regex t).IsMatch text)
+
 module Domain =
     /// Parse "1,88 тыс. подписчиков" / "1,2 млн" / "759 подписчиков" into a number.
     let parseCount (text: string) : int =

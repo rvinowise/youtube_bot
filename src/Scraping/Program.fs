@@ -19,7 +19,7 @@ USAGE
   scraping db                             check the database and apply the schema
   scraping videos [--state S] [--term T]  list videos with URLs and transcript size
   scraping hits [--topic T] [--term X]    pre-computed term mentions with timestamps
-  scraping channels [--topic T] [--term X] [--max-subs N]
+  scraping channels [--topic T] [--term X] [--max-subs N] [--sort mentions|surprise]
                                           hits grouped by channel -- who to talk to
   scraping backfill-subs [--limit N]      fill subscriber counts from channel pages
   scraping recheck --topic T [--limit N]  re-fetch captions, restore hit timestamps
@@ -38,8 +38,10 @@ USAGE
 
 SCAN OPTIONS
   --topic NAME          topic name, e.g. "immortality" (required)
-  --stems "a,b+c,d"     terms; `+` means all stems in the same segment
+  --stems "a,b+c,d"     terms; `+` = word-boundary stems joined by one word break
                         (default: the built-in immortality vocabulary)
+  --exclude "a,b"       disqualify a hit when any of these matches its context
+                        (e.g. религиозные слова), stored on the topic
   --seed-video ID[,ID]  starting video(s); repeatable, idempotent
   --related N           recommendations taken per video (default 20)
   --max-per-channel N   stop expanding a channel after N videos (0 = no cap)
@@ -264,22 +266,23 @@ let private backfillCommand (args: string list) : Task<int> =
             Console.WriteLine "missing --topic"
             return 1
         else
-            let topicId = Db.ensureTopic topicName []
+            Db.ensureTopic topicName [] |> ignore
 
             if flag args "--reset" then
-                let deleted = Db.clearHits topicId
+                let deleted = Db.clearHits topicName
                 Console.WriteLine(sprintf "cleared hits: %d" deleted)
 
-            let stems = Db.topicStems topicId
-            let rows = Db.transcriptsWithoutHits topicId
+            let stems = Db.topicStems topicName
+            let exclude = Db.topicExclude topicName
+            let rows = Db.transcriptsWithoutHits topicName
             Console.WriteLine(sprintf "topic %s: terms %s" topicName (String.concat ", " stems))
             Console.WriteLine(sprintf "topic %s: transcripts without hits: %d" topicName rows.Length)
 
             let mutable total = 0
 
             for t in rows do
-                let hits = Scan.hitsFromText stems t.text
-                Db.insertHits topicId t.video_id hits
+                let hits = Scan.hitsFromText stems exclude t.text
+                Db.insertHits topicName t.video_id hits
                 total <- total + hits.Length
 
             Console.WriteLine(sprintf "inserted hits: %d" total)
@@ -371,11 +374,12 @@ let private recheckCommand (args: string list) : Task<int> =
             Console.WriteLine "missing --topic"
             return 1
         else
-            let topicId = Db.ensureTopic topicName []
-            let stems = Db.topicStems topicId
+            Db.ensureTopic topicName [] |> ignore
+            let stems = Db.topicStems topicName
+            let exclude = Db.topicExclude topicName
             let limit = intOf args "--limit" 0
             let delay = intOf args "--delay" 300
-            let ids = Db.videosWithUntimedHits topicId limit
+            let ids = Db.videosWithUntimedHits topicName limit
             let exe = YtDlp.resolvePath Settings.ytDlpPath
 
             Console.WriteLine(sprintf "videos with untimed hits: %d" ids.Length)
@@ -385,7 +389,7 @@ let private recheckCommand (args: string list) : Task<int> =
 
             for id in ids do
                 i <- i + 1
-                let! refreshed = Scan.refreshVideo exe topicId stems id
+                let! refreshed = Scan.refreshVideo exe topicName stems exclude id
                 if refreshed then ok <- ok + 1
                 Console.Write(sprintf "\r[%d/%d] refreshed %d | %s" i ids.Length ok id)
                 do! Http.delay delay
@@ -402,7 +406,8 @@ let private channelsCommand (args: string list) : Task<int> =
         let term = valueOf args "--term" ""
         let limit = intOf args "--limit" 50
         let maxSubs = intOf args "--max-subs" 0
-        let rows = Db.listChannels topic term limit maxSubs
+        let sortBy = valueOf args "--sort" "mentions"
+        let rows = Db.listChannels topic term limit maxSubs sortBy
 
         Console.WriteLine(
             sprintf
@@ -412,11 +417,12 @@ let private channelsCommand (args: string list) : Task<int> =
         )
 
         printTable
-            [ "channel"; "subs"; "videos"; "mentions"; "d"; "url"; "sample" ]
+            [ "channel"; "subs"; "videos"; "of"; "mentions"; "d"; "url"; "sample" ]
             [ for r in rows ->
                   [ r.channel
                     string r.subs
                     string r.videos
+                    string r.videos_total
                     string r.mentions
                     string r.depth
                     r.url
@@ -461,10 +467,9 @@ let private topicsCommand (_args: string list) : Task<int> =
         Console.WriteLine(sprintf "topics: %d" rows.Length)
 
         printTable
-            [ "id"; "name"; "queued"; "expanded"; "videos"; "hits"; "terms" ]
+            [ "name"; "queued"; "expanded"; "videos"; "hits"; "terms" ]
             [ for r in rows ->
-                  [ string r.id
-                    r.name
+                  [ r.name
                     string r.queued
                     string r.expanded
                     string r.videos
@@ -563,13 +568,12 @@ let private requeueCommand (args: string list) : Task<int> =
             Console.WriteLine "missing --topic"
             return 1
         else
-            match Db.topicIdByName topic with
-            | None ->
+            if not (Db.topicExists topic) then
                 Console.WriteLine(sprintf "no such topic: %s" topic)
                 return 1
-            | Some topicId ->
+            else
                 let withNoCaptions = flag args "--with-no-captions"
-                let n = Db.requeueFailed topicId withNoCaptions
+                let n = Db.requeueFailed topic withNoCaptions
 
                 Console.WriteLine(
                     sprintf
@@ -605,9 +609,13 @@ let private scanCommand (args: string list) : Task<int> =
             if valueOf args "--stems" "" <> "" then
                 Db.setTopicStems (Db.ensureTopic topic stems) stems
 
+            if valueOf args "--exclude" "" <> "" then
+                Db.setTopicExclude (Db.ensureTopic topic stems) (splitCsv (valueOf args "--exclude" ""))
+
             let options =
                 { Topic = topic
                   Stems = stems
+                  Exclude = splitCsv (valueOf args "--exclude" "")
                   SeedVideos = seeds
                   RelatedLimit = intOf args "--related" 20
                   MaxPerChannel = intOf args "--max-per-channel" 0
