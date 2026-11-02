@@ -164,6 +164,7 @@ module Scan =
                     match transcript with
                     | Ok segments ->
                         Db.saveTranscript videoId (Transcript.toText segments)
+                        Db.saveSegments videoId (segments |> List.map (fun s -> s.StartMs, s.Text))
 
                         Db.markVideoDone
                             videoId
@@ -263,6 +264,28 @@ module Scan =
                     item.depth,
                     related.Length
                 )
+        }
+
+    /// Re-fetch the captions of one video and recompute its hits, so the rows
+    /// get real timestamps. Used by `recheck` after hits were scored from a
+    /// flat, timestamp-less transcript.
+    let refreshVideo (exe: string) (topicId: int64) (stems: string list) (videoId: string) : Task<bool> =
+        task {
+            let! meta = YtDlp.fetchMeta exe videoId
+
+            match meta with
+            | Error _ -> return false
+            | Ok m ->
+                let! transcript = Transcript.fetch m.Captions
+
+                match transcript with
+                | Ok segments ->
+                    Db.saveTranscript videoId (Transcript.toText segments)
+                    Db.saveSegments videoId (segments |> List.map (fun s -> s.StartMs, s.Text))
+                    Db.deleteHitsForVideo topicId videoId
+                    Db.insertHits topicId videoId (hitsFromSegments stems segments)
+                    return true
+                | Error _ -> return false
         }
 
     // ------------------------------------------------------------ entry

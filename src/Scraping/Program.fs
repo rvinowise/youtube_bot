@@ -1,4 +1,4 @@
-module Scraping.Program
+﻿module Scraping.Program
 
 open System
 open System.IO
@@ -22,6 +22,7 @@ USAGE
   scraping channels [--topic T] [--term X] [--max-subs N]
                                           hits grouped by channel -- who to talk to
   scraping backfill-subs [--limit N]      fill subscriber counts from channel pages
+  scraping recheck --topic T [--limit N]  re-fetch captions, restore hit timestamps
   scraping backfill --topic T [--reset]   recompute hits; --reset wipes them first
   scraping backfill-titles [--limit N]    fill missing titles/channels via oEmbed
   scraping requeue --topic T [--with-no-captions]
@@ -357,6 +358,43 @@ let private backfillSubsCommand (args: string list) : Task<int> =
         return 0
     }
 
+/// Re-fetch captions for videos whose hits lost their timestamps and score
+/// them again from segments. Network-bound, one yt-dlp call per video.
+let private recheckCommand (args: string list) : Task<int> =
+    task {
+        Db.init Settings.connectionString
+        Db.migrate ()
+
+        let topicName = valueOf args "--topic" ""
+
+        if topicName = "" then
+            Console.WriteLine "missing --topic"
+            return 1
+        else
+            let topicId = Db.ensureTopic topicName []
+            let stems = Db.topicStems topicId
+            let limit = intOf args "--limit" 0
+            let delay = intOf args "--delay" 300
+            let ids = Db.videosWithUntimedHits topicId limit
+            let exe = YtDlp.resolvePath Settings.ytDlpPath
+
+            Console.WriteLine(sprintf "videos with untimed hits: %d" ids.Length)
+
+            let mutable ok = 0
+            let mutable i = 0
+
+            for id in ids do
+                i <- i + 1
+                let! refreshed = Scan.refreshVideo exe topicId stems id
+                if refreshed then ok <- ok + 1
+                Console.Write(sprintf "\r[%d/%d] refreshed %d | %s" i ids.Length ok id)
+                do! Http.delay delay
+
+            Console.WriteLine()
+            Console.WriteLine(sprintf "refreshed: %d of %d" ok ids.Length)
+            return 0
+    }
+
 let private channelsCommand (args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
@@ -613,6 +651,7 @@ let main argv =
         | "backfill" -> backfillCommand rest
         | "backfill-titles" -> backfillTitlesCommand rest
         | "backfill-subs" -> backfillSubsCommand rest
+        | "recheck" -> recheckCommand rest
         | "requeue" -> requeueCommand rest
         | "sql" -> sqlCommand rest
         | "find" -> findCommand rest

@@ -1,4 +1,4 @@
-namespace Scraping
+﻿namespace Scraping
 
 open System
 open Npgsql
@@ -172,6 +172,14 @@ alter table video add column if not exists channel_followers int not null defaul
 
 create index if not exists video_state_idx   on video (state);
 create index if not exists video_channel_idx on video (channel_id);
+
+create table if not exists transcript_segment (
+    video_id text not null references video(id) on delete cascade,
+    idx      int  not null,
+    start_ms int  not null,
+    text     text not null,
+    primary key (video_id, idx)
+);
 
 create table if not exists transcript (
     video_id   text primary key references video(id) on delete cascade,
@@ -410,6 +418,60 @@ where topic_id = @topic and video_id = @video
             "select video_id, lang, source, text, chars from transcript where video_id = @id",
             {| id = videoId |}
         )
+
+    /// Keep the timestamped segments, so `backfill --reset` can recompute hits
+    /// with real timestamps instead of a flat string.
+    let saveSegments (videoId: string) (segments: (int * string) list) =
+        use conn = openConnection()
+
+        conn.Execute("delete from transcript_segment where video_id = @id", {| id = videoId |})
+        |> ignore
+
+        segments
+        |> List.iteri (fun i (startMs, text) ->
+            conn.Execute(
+                "insert into transcript_segment (video_id, idx, start_ms, text) values (@video, @idx, @start, @text)",
+                {| video = videoId
+                   idx = i
+                   start = startMs
+                   text = text |}
+            )
+            |> ignore)
+
+    let getSegments (videoId: string) : (int * string) list =
+        use conn = openConnection()
+
+        conn.Query<int * string>(
+            "select start_ms, text from transcript_segment where video_id = @id order by idx",
+            {| id = videoId |}
+        )
+        |> Seq.toList
+
+    /// Videos of the topic whose hits have no timestamp (scored from flat text).
+    let videosWithUntimedHits (topicId: int64) (limit: int) : string list =
+        use conn = openConnection()
+
+        let lim = if limit <= 0 then Nullable<int>() else Nullable limit
+
+        conn.Query<string>(
+            """
+select distinct h.video_id
+from hit h
+where h.topic_id = @topic and h.t_start = 0
+limit @limit
+""",
+            {| topic = topicId; limit = lim |}
+        )
+        |> Seq.toList
+
+    let deleteHitsForVideo (topicId: int64) (videoId: string) =
+        use conn = openConnection()
+
+        conn.Execute(
+            "delete from hit where topic_id = @topic and video_id = @video",
+            {| topic = topicId; video = videoId |}
+        )
+        |> ignore
 
     let saveTranscript (videoId: string) (text: string) =
         use conn = openConnection()
