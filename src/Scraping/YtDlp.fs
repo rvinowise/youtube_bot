@@ -18,6 +18,8 @@ type VideoMeta =
       Duration: int
       ChannelId: string
       ChannelName: string
+      /// Subscriber count at scan time. 0 when YouTube hides it.
+      Followers: int
       UploadDate: string
       Captions: CaptionTrack list }
 
@@ -156,6 +158,7 @@ module YtDlp =
                               Duration = asInt root "duration"
                               ChannelId = asString root "channel_id"
                               ChannelName = asString root "channel"
+                              Followers = asInt root "channel_follower_count"
                               UploadDate = asString root "upload_date"
                               Captions = parseCaptions root }
                 with e ->

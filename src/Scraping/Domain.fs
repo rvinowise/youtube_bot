@@ -75,9 +75,18 @@ type ScannedChannel =
       Url: string }
 
 /// A topic is a named set of terms. A term is a `+`-joined conjunction of
-/// stems: `"загрузк+сознани"` matches only segments that contain both, which
-/// is what keeps "матриц цифровых камер" out of the digital-immortality hits.
+/// stems, and matching is regex-based on word boundaries:
+///
+///   `"вечн+жизн"`  ->  \bвечн\w*\W+жизн\w*     "вечная жизнь", not "лететь вечно"
+///   `"бессмерт"`   ->  \bбессмерт\w*           "бессмертие", not "обессмертить"
+///
+/// `\b` (start of word) + stem + `\w*` (any word ending) is what stops
+/// "перезагрузка" from matching "загрузк", and `\W+` between stems requires
+/// them to be adjacent words rather than scattered across a long caption.
 module HitTerms =
+
+    open System.Collections.Concurrent
+    open System.Text.RegularExpressions
 
     /// Default vocabulary for the immortality / transhumanism topic.
     let defaultStems =
@@ -86,13 +95,16 @@ module HitTerms =
           "трансгуман"
           "крионик"
           "вечн+жизн"
-          "загрузк+сознани"
           "цифров+бессмерт"
           "продлени+жизн"
           "старени"
           // "воскрес" matched "воскресенье" (Sunday); the resurrection stem is
           // "воскресени" (воскресение / воскрешение).
-          "воскресени" ]
+          "воскресени"
+          // Digital uploading: two separate terms, both word-bounded, so
+          // "перезагрузка" no longer fires.
+          "загрузк+сознани"
+          "оцифровк+сознани" ]
 
     /// `"загрузк+сознани"` -> `["загрузк"; "сознани"]`.
     let stemsOf (term: string) : string list =
@@ -101,19 +113,30 @@ module HitTerms =
         |> Array.filter (fun s -> s <> "")
         |> List.ofArray
 
-    /// True when every stem of the term occurs in `text` (already lowercased).
-    let matches (lowerText: string) (term: string) =
-        let stems = stemsOf term
-        not stems.IsEmpty && stems |> List.forall lowerText.Contains
+    let private cache = ConcurrentDictionary<string, Regex>()
 
-    /// Position of the first stem that is actually present.
-    let firstIndex (lowerText: string) (term: string) =
-        stemsOf term
-        |> List.map lowerText.IndexOf
-        |> List.filter (fun i -> i >= 0)
-        |> function
-            | [] -> 0
-            | xs -> List.min xs
+    /// Compiled regex for one term. Stems are regex-escaped, so a stray `.` or
+    /// `(` in the vocabulary cannot break the matcher.
+    let regex (term: string) : Regex =
+        cache.GetOrAdd(
+            term,
+            fun t ->
+                let pattern =
+                    stemsOf t
+                    |> List.map (fun s -> @"\b" + Regex.Escape s + @"\w*")
+                    |> String.concat @"\W+"
+
+                Regex(pattern, RegexOptions.Compiled ||| RegexOptions.IgnoreCase)
+        )
+
+    /// True when the term matches anywhere in `text`.
+    let matches (text: string) (term: string) =
+        not (System.String.IsNullOrEmpty text) && (regex term).IsMatch text
+
+    /// Position of the match, 0 when there is none.
+    let firstIndex (text: string) (term: string) =
+        let m = (regex term).Match text
+        if m.Success then m.Index else 0
 
 module Domain =
     /// Parse "1,88 тыс. подписчиков" / "1,2 млн" / "759 подписчиков" into a number.

@@ -37,7 +37,8 @@ type Frontier_row =
       depth: int
       parent_id: string
       state: string
-      attempts: int }
+      attempts: int
+      priority: float }
 
 type Video_table() =
     override _.ToString() = "video"
@@ -135,12 +136,14 @@ create table if not exists frontier (
     attempts  int  not null default 0,
     added_at  timestamptz not null default now(),
     next_attempt_at timestamptz not null default now(),
+    priority  real not null default 0,
     primary key (topic_id, video_id)
 );
 
 alter table frontier add column if not exists next_attempt_at timestamptz not null default now();
+alter table frontier add column if not exists priority real not null default 0;
 
-create index if not exists frontier_queue_idx on frontier (topic_id, state, next_attempt_at);
+create index if not exists frontier_queue_idx on frontier (topic_id, state, priority, next_attempt_at);
 
 create table if not exists video (
     id             text primary key,
@@ -165,6 +168,7 @@ alter table video add column if not exists parent_id      text null;
 alter table video add column if not exists discovered_via text not null default 'seed';
 alter table video add column if not exists channel_name   text not null default '';
 alter table video add column if not exists channel_url    text not null default '';
+alter table video add column if not exists channel_followers int not null default 0;
 
 create index if not exists video_state_idx   on video (state);
 create index if not exists video_channel_idx on video (channel_id);
@@ -289,7 +293,10 @@ order by t.id
         |> ignore
 
     /// Add a video to the topic's queue. Idempotent.
-    let enqueue (topicId: int64) (videoId: string) (depth: int) (parentId: string) (via: string) =
+    ///
+    /// `priority` is inherited from the parent and bumped by the parent's own
+    /// hits, so the crawl follows the thread that is paying off.
+    let enqueue (topicId: int64) (videoId: string) (depth: int) (parentId: string) (via: string) (priority: float) =
         use conn = openConnection()
 
         conn.Execute(
@@ -307,18 +314,24 @@ on conflict (id) do nothing
 
         conn.Execute(
             """
-insert into frontier (topic_id, video_id, depth, parent_id)
-values (@topic, @video, @depth, @parent)
-on conflict (topic_id, video_id) do nothing
+insert into frontier (topic_id, video_id, depth, parent_id, priority)
+values (@topic, @video, @depth, @parent, @priority)
+on conflict (topic_id, video_id) do update
+set priority = greatest(frontier.priority, excluded.priority)
 """,
             {| topic = topicId
                video = videoId
                depth = depth
-               parent = (if isNull parentId then null else box parentId) |}
+               parent = (if isNull parentId then null else box parentId)
+               priority = priority |}
         )
         |> ignore
 
-    /// Take the shallowest queued item and mark it `running`.
+    /// Take the highest-priority queued item and mark it `running`.
+    ///
+    /// Best-first: `priority` is accumulated down the tree from the seeds, so a
+    /// video whose parent mentioned the topic is expanded long before an
+    /// equally shallow video from an unrelated neighbourhood.
     let claimFrontier (topicId: int64) : Frontier_row =
         use conn = openConnection()
 
@@ -329,11 +342,11 @@ where (topic_id, video_id) = (
     select topic_id, video_id
     from frontier
     where topic_id = @topic and state = 'queued' and next_attempt_at <= now()
-    order by depth, next_attempt_at
+    order by priority desc, depth, next_attempt_at
     limit 1
     for update skip locked
 )
-returning topic_id, video_id, depth, parent_id, state, attempts
+returning topic_id, video_id, depth, parent_id, state, attempts, priority
 """,
             {| topic = topicId |}
         )
@@ -419,6 +432,7 @@ set text = excluded.text, chars = excluded.chars, fetched_at = now()
         (title: string)
         (channelId: string)
         (channelName: string)
+        (followers: int)
         (duration: int)
         (published: Nullable<DateTime>)
         =
@@ -433,6 +447,7 @@ update video set state = 'done', has_captions = true, attempts = attempts + 1,
        channel_name = case when @channel_name = '' then channel_name else @channel_name end,
        channel_url = case when @channel_id = '' then channel_url
                           else 'https://www.youtube.com/channel/' || @channel_id end,
+       channel_followers = greatest(channel_followers, @followers),
        updated_at = now()
 where id = @id
 """,
@@ -441,6 +456,7 @@ where id = @id
                title = title
                channel_id = channelId
                channel_name = channelName
+               followers = followers
                id = videoId |}
         )
         |> ignore
@@ -459,6 +475,38 @@ where id = @id
                channel_name = channelName
                channel_url = channelUrl
                id = videoId |}
+        )
+        |> ignore
+
+    type ChannelNoSubs =
+        { name: string
+          url: string }
+
+    /// Channels whose subscriber count we never learned, busiest first.
+    let channelsWithoutSubs (limit: int) : ChannelNoSubs list =
+        use conn = openConnection()
+
+        let lim = if limit <= 0 then Nullable<int>() else Nullable limit
+
+        conn.Query<ChannelNoSubs>(
+            """
+select channel_name as name, min(channel_url) as url
+from video
+where channel_followers = 0 and channel_url <> '' and channel_name <> ''
+group by channel_name
+order by count(*) desc
+limit @limit
+""",
+            {| limit = lim |}
+        )
+        |> Seq.toList
+
+    let setChannelSubs (channelName: string) (subs: int) =
+        use conn = openConnection()
+
+        conn.Execute(
+            "update video set channel_followers = @subs where channel_name = @channel and channel_followers = 0",
+            {| subs = subs; channel = channelName |}
         )
         |> ignore
 
@@ -517,6 +565,7 @@ where id = @id and state <> 'done'
         (title: string)
         (channelId: string)
         (channelName: string)
+        (followers: int)
         (reason: string)
         (duration: int)
         =
@@ -531,6 +580,7 @@ update video set state = 'no_captions', has_captions = false, attempts = attempt
        channel_name = case when @channel_name = '' then channel_name else @channel_name end,
        channel_url = case when @channel_id = '' then channel_url
                           else 'https://www.youtube.com/channel/' || @channel_id end,
+       channel_followers = greatest(channel_followers, @followers),
        updated_at = now()
 where id = @id
 """,
@@ -539,9 +589,18 @@ where id = @id
                title = title
                channel_id = channelId
                channel_name = channelName
+               followers = followers
                id = videoId |}
         )
         |> ignore
+
+    /// Delete every hit of a topic, so `backfill` can recompute them after the
+    /// vocabulary changed. Nothing else is touched: the frontier and the video
+    /// table are history, not a match set.
+    let clearHits (topicId: int64) : int =
+        use conn = openConnection()
+
+        conn.Execute("delete from hit where topic_id = @topic", {| topic = topicId |})
 
     let markVideoFailed (videoId: string) (reason: string) =
         use conn = openConnection()
@@ -669,6 +728,7 @@ limit @limit
     type ChannelRow =
         { channel: string
           url: string
+          subs: int64
           videos: int64
           mentions: int64
           depth: int
@@ -676,14 +736,16 @@ limit @limit
 
     /// Hits grouped by channel: the point is to find *people*, not videos.
     /// A channel with 3 mentions in 3 different videos is a much better lead
-    /// than a factory channel with 1 mention in 1 video.
-    let listChannels (topicName: string) (term: string) (limit: int) =
+    /// than a factory channel with 1 mention in 1 video. `maxSubs > 0` keeps
+    /// only channels small enough to still be "a beginner blogger".
+    let listChannels (topicName: string) (term: string) (limit: int) (maxSubs: int) =
         use conn = openConnection()
 
         conn.Query<ChannelRow>(
             """
 select v.channel_name as channel,
        coalesce((array_agg(distinct v.channel_url))[1], '') as url,
+       max(v.channel_followers) as subs,
        count(distinct h.video_id) as videos,
        count(*) as mentions,
        min(v.depth) as depth,
@@ -695,10 +757,14 @@ where (@topic = '' or t.name = @topic)
   and (@term = '' or h.term = @term)
   and v.channel_name <> ''
 group by v.channel_name
+having (@max_subs <= 0 or max(v.channel_followers) <= @max_subs)
 order by mentions desc, videos desc
 limit @limit
 """,
-            {| topic = topicName; term = term; limit = limit |}
+            {| topic = topicName
+               term = term
+               limit = limit
+               max_subs = maxSubs |}
         )
         |> Seq.toList
 

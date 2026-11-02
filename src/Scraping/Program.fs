@@ -19,9 +19,10 @@ USAGE
   scraping db                             check the database and apply the schema
   scraping videos [--state S] [--term T]  list videos with URLs and transcript size
   scraping hits [--topic T] [--term X]    pre-computed term mentions with timestamps
-  scraping channels [--topic T] [--term X]
+  scraping channels [--topic T] [--term X] [--max-subs N]
                                           hits grouped by channel -- who to talk to
-  scraping backfill --topic T             recompute hits for transcripts that have none
+  scraping backfill-subs [--limit N]      fill subscriber counts from channel pages
+  scraping backfill --topic T [--reset]   recompute hits; --reset wipes them first
   scraping backfill-titles [--limit N]    fill missing titles/channels via oEmbed
   scraping requeue --topic T [--with-no-captions]
                                           retry failed / caption-less videos of a topic
@@ -263,8 +264,14 @@ let private backfillCommand (args: string list) : Task<int> =
             return 1
         else
             let topicId = Db.ensureTopic topicName []
+
+            if flag args "--reset" then
+                let deleted = Db.clearHits topicId
+                Console.WriteLine(sprintf "cleared hits: %d" deleted)
+
             let stems = Db.topicStems topicId
             let rows = Db.transcriptsWithoutHits topicId
+            Console.WriteLine(sprintf "topic %s: terms %s" topicName (String.concat ", " stems))
             Console.WriteLine(sprintf "topic %s: transcripts without hits: %d" topicName rows.Length)
 
             let mutable total = 0
@@ -315,20 +322,62 @@ let private backfillTitlesCommand (args: string list) : Task<int> =
         return 0
     }
 
+/// Fill subscriber counts via the channel page. Independent of scanning:
+/// the frontier is untouched, only `video.channel_followers` is updated.
+let private backfillSubsCommand (args: string list) : Task<int> =
+    task {
+        Db.init Settings.connectionString
+        Db.migrate ()
+
+        let limit = intOf args "--limit" 0
+        let delay = intOf args "--delay" 200
+        let rows = Db.channelsWithoutSubs limit
+
+        Console.WriteLine(sprintf "channels without subs: %d" rows.Length)
+
+        let mutable ok = 0
+        let mutable failed = 0
+        let mutable i = 0
+
+        for r in rows do
+            i <- i + 1
+            let! subs = YouTube.channelSubs r.url
+
+            match subs with
+            | Some n when n > 0 ->
+                Db.setChannelSubs r.name n
+                ok <- ok + 1
+            | _ -> failed <- failed + 1
+
+            Console.Write(sprintf "\r[%d/%d] ok %d | failed %d | %s" i rows.Length ok failed r.name)
+            do! Http.delay delay
+
+        Console.WriteLine()
+        Console.WriteLine(sprintf "subs filled: %d, unknown: %d" ok failed)
+        return 0
+    }
+
 let private channelsCommand (args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
         let topic = valueOf args "--topic" ""
         let term = valueOf args "--term" ""
         let limit = intOf args "--limit" 50
-        let rows = Db.listChannels topic term limit
+        let maxSubs = intOf args "--max-subs" 0
+        let rows = Db.listChannels topic term limit maxSubs
 
-        Console.WriteLine(sprintf "channels: %d" rows.Length)
+        Console.WriteLine(
+            sprintf
+                "channels: %d%s"
+                rows.Length
+                (if maxSubs > 0 then sprintf " (only channels with <= %d subs)" maxSubs else "")
+        )
 
         printTable
-            [ "channel"; "videos"; "mentions"; "d"; "url"; "sample" ]
+            [ "channel"; "subs"; "videos"; "mentions"; "d"; "url"; "sample" ]
             [ for r in rows ->
                   [ r.channel
+                    string r.subs
                     string r.videos
                     string r.mentions
                     string r.depth
@@ -563,6 +612,7 @@ let main argv =
         | "channels" -> channelsCommand rest
         | "backfill" -> backfillCommand rest
         | "backfill-titles" -> backfillTitlesCommand rest
+        | "backfill-subs" -> backfillSubsCommand rest
         | "requeue" -> requeueCommand rest
         | "sql" -> sqlCommand rest
         | "find" -> findCommand rest

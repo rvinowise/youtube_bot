@@ -170,12 +170,20 @@ module Scan =
                             m.Title
                             m.ChannelId
                             m.ChannelName
+                            m.Followers
                             m.Duration
                             (parseUploadDate m.UploadDate)
 
                         return Ok(Some segments)
                     | Error(NoCaptions reason) ->
-                        Db.markVideoNoCaptions videoId m.Title m.ChannelId m.ChannelName reason m.Duration
+                        Db.markVideoNoCaptions
+                            videoId
+                            m.Title
+                            m.ChannelId
+                            m.ChannelName
+                            m.Followers
+                            reason
+                            m.Duration
                         return Error(NoCaptions reason)
                     | Error(Transient reason) -> return Error(Transient reason)
         }
@@ -233,8 +241,13 @@ module Scan =
                 else
                     YouTube.relatedVideos item.video_id options.RelatedLimit
 
+            // Best-first: children inherit the parent's priority plus whatever
+            // the parent's own transcript earned. A video whose parent actually
+            // said "бессмертие" outranks one four hops from anywhere.
+            let childPriority = item.priority + float hits.Length
+
             for (id, _title) in related do
-                Db.enqueue topicId id (item.depth + 1) item.video_id "related"
+                Db.enqueue topicId id (item.depth + 1) item.video_id "related" childPriority
 
             match transcript with
             | Error(Transient reason) ->
@@ -273,7 +286,7 @@ module Scan =
             Db.resetRunning topicId
 
             for videoId in options.SeedVideos do
-                Db.enqueue topicId videoId 0 null "seed"
+                Db.enqueue topicId videoId 0 null "seed" 0.0
                 Log.Information("seed: {Video}", videoId)
 
             counters.Queued <- Db.queuedCount topicId

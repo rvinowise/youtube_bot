@@ -163,6 +163,24 @@ let channelInfo (channelId: string) : Task<ChannelInfo option> =
                       VideosText = vidsText }
     }
 
+/// Subscriber count for a channel, given a `UC...` id or a full
+/// `https://youtube.com/@handle` URL. One HTML request, no cookies.
+let channelSubs (idOrUrl: string) : Task<int option> =
+    task {
+        let url =
+            if idOrUrl.StartsWith "http" then idOrUrl.TrimEnd('/') + "/about"
+            else sprintf "https://www.youtube.com/channel/%s/about" idOrUrl
+
+        let! html = Http.tryGetString url
+
+        match html with
+        | None -> return None
+        | Some h ->
+            match tryGroup pSubs h 1 with
+            | Some text when text.Trim() <> "" -> return Some(Domain.parseCount text)
+            | _ -> return None
+    }
+
 /// Pull (videoId, title) pairs out of a channel/playlist payload.
 let private collectVideoEntries (payload: string) (acc: ResizeArray<string * string>) =
     let lockups = splitBlocks markerLockup payload

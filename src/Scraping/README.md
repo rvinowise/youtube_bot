@@ -35,10 +35,14 @@ the yt-dlp releases page if missing). Connection string and paths live in
 
 ```
 topic      a named set of terms, e.g. "immortality"
-           terms are `+`-joined stems: "загрузк+сознани" = both in one segment
+           a term is `+`-joined word-boundary patterns:
+             "бессмерт"    -> \bбессмерт\w*       "бессмертие", not "обессмертить"
+             "вечн+жизн"   -> \bвечн\w*\W+жизн\w* "вечная жизнь", not "лететь вечно"
 
-frontier   the BFS queue, one per topic: (topic_id, video_id, depth, parent_id, state)
+frontier   the queue, one per topic: (topic_id, video_id, depth, parent_id, state, priority)
            queued -> running -> expanded | failed
+           `priority` = parent's priority + parent's hit count, so this is a
+           best-first walk, not a blind BFS
 
 video      global visited set: every video ever seen, with depth, parent,
            title, channel_name, channel_url
@@ -57,6 +61,7 @@ per topic, so two topics explore independently.
 | `topics` | topics with queue, expanded, video and hit counts |
 | `hits` | pre-computed term mentions with timestamps and deep links |
 | `channels` | hits grouped by channel — the actual "who to talk to" list |
+| `backfill-subs` | fill subscriber counts from channel pages |
 | `videos` | every visited video with URL, state, depth, transcript size |
 | `find` | ad-hoc search over the collected transcripts |
 | `backfill` | recompute hits for transcripts that have none |
@@ -234,6 +239,32 @@ raw counts, which is why `--max-per-channel` exists: after N videos of the same
 channel the scanner still scores them, but stops walking that channel's
 neighbourhood. `--max-per-channel 5` is a good default for a focused run.
 
+## Editing the vocabulary (important)
+
+`topic.stems` is the *filter*, not the history. Concretely:
+
+- Changing or deleting a term does **not** remove videos from the frontier and
+  does **not** stop them being part of the topic: visited videos are a trace of
+  where the crawl went, independent of what you are looking for.
+- Hits already stored were computed with the *old* vocabulary and stay in the
+  `hit` table, so `hits` / `channels` keep showing terms you just deleted.
+- `backfill` alone will not fix that: it only fills transcripts that have **no
+  hits at all**, which is why 6 000 transcripts were silently skipped before
+  v0.6.
+
+So after any vocabulary change:
+
+```bash
+dotnet run --project src/Scraping -- backfill --topic immortality --reset
+```
+
+`--reset` deletes the topic's hits first (nothing else — transcripts, frontier
+and videos stay), then re-scores every stored transcript with the new terms.
+It is offline: 6 000 transcripts take about a minute, no network.
+
+`--stems "a,b+c"` on `scan` now also updates an existing topic; before, the flag
+was silently ignored for any topic that already existed.
+
 ## Titles and channels
 
 `hits` and `videos` show the channel name next to the title, because a title
@@ -304,9 +335,9 @@ above, Gemini suggested a Playwright stealth extractor, while the actual fix was
   ~160 000. Watch `queued` in the progress line.
 - **~3–5 s per video** (`-J` with cookies + captions + watch page), so
   ~800–1 200 videos/hour at `--delay 2000`.
-- **Stems are naive.** `"воскрес"` matched "воскресенье" (Sunday) and produced
-  145 false hits; the vocabulary now uses `"воскресени"`. Any single stem will
-  still catch metaphors ("бессмертная память", "бессмертное наследие") — use
-  `+`-conjunctions when precision matters.
+- **Terms are literal.** Matching is word-boundary + stem + any ending, so
+  `бессмерт` still catches metaphors ("бессмертная память"). It no longer
+  catches "обессмертить" (different word start). `вечн+жизн` requires the two
+  words to be **adjacent**, so "вечная, светлая жизнь" is missed on purpose.
 - **No ASR.** Videos without auto-captions are marked `no_captions` and skipped
   (but still expanded). Adding `whisper.cpp` on the audio path is the next step.
