@@ -136,6 +136,38 @@ Start-Process dotnet -ArgumentList "run --project src\Scraping -- scan --topic i
 Get-Content work\run.log -Tail 3 -Wait
 ```
 
+## Excluded words, surprise ranking, origin
+
+A hit can be technically on-topic and still useless — a religious sermon, a
+conspiracy video, a factory channel name-dropping the word once. A topic
+therefore has an **exclude** list, using exactly the same `+`-joined
+word-boundary syntax as the needed terms:
+
+```bash
+dotnet run --project src/Scraping -- scan --topic immortality ^
+  --exclude "бог,господ,церк,библи,молитв,свящ,христ,коран" --seed-video XXX
+```
+
+If a needed term matches but any excluded term also matches the same segment
+(or the snippet window for text-only scoring), the hit is dropped. The list is
+stored on the topic (`topic.exclude`), so `backfill --topic X --reset`
+re-applies it retroactively. Empty by default: religion is a distraction in
+many cases but some believers are allies, so the policy is yours.
+
+`channels --sort surprise` ranks by how **rare** the mention is inside the
+channel's own body of work — 1 mention in 127 videos outranks 3 in 3:
+
+```
+channel                            subs     videos  of   mentions
+Центральное Телевидение            5010000  2       127  2
+ИСТОРИЯ НА КАРТЕ                   117000   1       31   1
+Ходорковский LIVE                  3400000  1       28   1
+```
+
+Every video records `origin` — the node name (`node` in appsettings, defaults
+to the machine name) that discovered it. It survives a merge, so after merging
+several databases you can still tell which machine found a lead.
+
 ## How the transcript path works
 
 1. `yt-dlp -4 --cookies-from-browser firefox --ignore-no-formats-error
