@@ -23,3 +23,7 @@ work/
 yt_blogger_candidates.tsv
 yt_blogger_videos.tsv
 yt_thumbs/
+
+# VPN configs contain private keys -- never commit
+utils/vpn/
+*.conf

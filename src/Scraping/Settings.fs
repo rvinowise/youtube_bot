@@ -37,6 +37,26 @@ module Settings =
     let workDir =
         configuration.GetValue<string>("work_dir", "work")
 
+    // ---- VPN rotation (AmneziaWG) -------------------------------------------
+    // Installing a tunnel needs administrator rights; when the scraper is not
+    // elevated the calls fail and the crawl simply continues on the current IP.
+    let vpnExe =
+        configuration.GetValue<string>("vpn:exe", @"C:\Program Files\AmneziaWG\AmneziaWG.exe")
+
+    let vpnConfigsDir =
+        configuration.GetValue<string>("vpn:configs_dir", "utils/vpn")
+
+    let vpnEnabled =
+        configuration.GetValue<bool>("vpn:enabled", false)
+
+    /// Rotate after this many expanded videos (0 = only on rate limits).
+    let vpnRotateEvery =
+        configuration.GetValue<int>("vpn:rotate_every_videos", 0)
+
+    /// Time to let the tunnel come up before the next request.
+    let vpnSettleMs =
+        configuration.GetValue<int>("vpn:settle_ms", 6000)
+
     /// Name of this scraping node, stored on every video it discovers. Several
     /// machines can scrape into separate databases and be merged later; this is
     /// what keeps "which machine found this" answerable after the merge.

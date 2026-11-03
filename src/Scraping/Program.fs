@@ -23,6 +23,8 @@ USAGE
                                           hits grouped by channel -- who to talk to
   scraping backfill-subs [--limit N]      fill subscriber counts from channel pages
   scraping recheck --topic T [--limit N]  re-fetch captions, restore hit timestamps
+  scraping vpn [--list|--rotate|--connect NAME|--disconnect]
+                                          inspect / switch AmneziaWG tunnels (needs admin)
   scraping backfill --topic T [--reset]   recompute hits; --reset wipes them first
   scraping backfill-titles [--limit N]    fill missing titles/channels via oEmbed
   scraping requeue --topic T [--with-no-captions]
@@ -399,6 +401,72 @@ let private recheckCommand (args: string list) : Task<int> =
             return 0
     }
 
+/// Inspect and drive the AmneziaWG tunnels used for IP rotation.
+/// Installing a tunnel needs administrator rights; without them the command
+/// reports the error instead of failing silently.
+let private vpnCommand (args: string list) : Task<int> =
+    task {
+        let confs = Vpn.configs ()
+        let current = Vpn.current ()
+
+        if flag args "--list" || args.IsEmpty then
+            Console.WriteLine(sprintf "exe:      %s (exists: %b)" Settings.vpnExe (File.Exists Settings.vpnExe))
+            Console.WriteLine(sprintf "configs:  %s" Settings.vpnConfigsDir)
+            Console.WriteLine(sprintf "enabled:  %b" Settings.vpnEnabled)
+
+            for c in confs do
+                Console.WriteLine(sprintf "  %s" (Vpn.tunnelName c))
+
+            Console.WriteLine(sprintf "current:  %s" (defaultArg current "(none)"))
+            return 0
+        elif flag args "--rotate" then
+            let! result = Vpn.rotate ()
+
+            match result with
+            | Ok name ->
+                Console.WriteLine(sprintf "rotated to %s" name)
+                return 0
+            | Error reason ->
+                Console.WriteLine(sprintf "rotation failed: %s" reason)
+                return 1
+        elif flag args "--disconnect" then
+            match current with
+            | None ->
+                Console.WriteLine "no tunnel recorded"
+                return 0
+            | Some name ->
+                let! result = Vpn.disconnect name
+
+                match result with
+                | Ok() ->
+                    Console.WriteLine(sprintf "disconnected %s" name)
+                    return 0
+                | Error reason ->
+                    Console.WriteLine(sprintf "disconnect failed: %s" reason)
+                    return 1
+        else
+            let wanted = valueOf args "--connect" ""
+
+            let conf =
+                confs
+                |> List.tryFind (fun c -> Vpn.tunnelName c = wanted || c = wanted)
+
+            match conf with
+            | None ->
+                Console.WriteLine(sprintf "no such config: %s (try --list)" wanted)
+                return 1
+            | Some c ->
+                let! result = Vpn.connect c
+
+                match result with
+                | Ok name ->
+                    Console.WriteLine(sprintf "connected %s" name)
+                    return 0
+                | Error reason ->
+                    Console.WriteLine(sprintf "connect failed: %s" reason)
+                    return 1
+    }
+
 let private channelsCommand (args: string list) : Task<int> =
     task {
         Db.init Settings.connectionString
@@ -660,6 +728,7 @@ let main argv =
         | "backfill-titles" -> backfillTitlesCommand rest
         | "backfill-subs" -> backfillSubsCommand rest
         | "recheck" -> recheckCommand rest
+        | "vpn" -> vpnCommand rest
         | "requeue" -> requeueCommand rest
         | "sql" -> sqlCommand rest
         | "find" -> findCommand rest

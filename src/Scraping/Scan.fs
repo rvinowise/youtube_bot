@@ -373,17 +373,55 @@ module Scan =
                         consecutiveFailures <- consecutiveFailures + 1
 
                         if consecutiveFailures >= 3 then
-                            // Global rate limit: happening one video after
-                            // another with a per-video backoff still queued.
-                            // Pause the whole scanner, otherwise an overnight
-                            // run makes no progress at all.
-                            counters.Current <- "cooling down 5 min"
-                            render ()
-                            Log.Warning("rate limit: cooling down 5 min after {N} consecutive failures", consecutiveFailures)
-                            do! Http.delay 300000
+                            // Global rate limit: one video after another, with
+                            // the per-video backoff still queued. Either switch
+                            // exit IP (VPN) or pause the whole scanner.
+                            if Settings.vpnEnabled then
+                                counters.Current <- "rotating vpn"
+                                render ()
+
+                                let! rotated = Vpn.rotate ()
+
+                                match rotated with
+                                | Ok name ->
+                                    Log.Warning(
+                                        "rate limit: {N} consecutive failures, switched to {Tunnel}",
+                                        consecutiveFailures,
+                                        name
+                                    )
+                                | Error reason ->
+                                    Log.Warning(
+                                        "rate limit: {N} consecutive failures, vpn rotation failed ({Reason}) — cooling down 5 min",
+                                        consecutiveFailures,
+                                        reason
+                                    )
+
+                                    do! Http.delay 300000
+                            else
+                                counters.Current <- "cooling down 5 min"
+                                render ()
+
+                                Log.Warning(
+                                    "rate limit: cooling down 5 min after {N} consecutive failures",
+                                    consecutiveFailures
+                                )
+
+                                do! Http.delay 300000
+
                             consecutiveFailures <- 0
                     else
                         consecutiveFailures <- 0
+
+                    // Optional periodic rotation, independent of failures.
+                    if
+                        Settings.vpnEnabled
+                        && Settings.vpnRotateEvery > 0
+                        && counters.Expanded % Settings.vpnRotateEvery = 0
+                    then
+                        counters.Current <- "rotating vpn"
+                        render ()
+                        let! _ = Vpn.rotate ()
+                        ()
 
                     do! Http.delay options.DelayMs
 

@@ -271,6 +271,37 @@ raw counts, which is why `--max-per-channel` exists: after N videos of the same
 channel the scanner still scores them, but stops walking that channel's
 neighbourhood. `--max-per-channel 5` is a good default for a focused run.
 
+## IP rotation (AmneziaWG)
+
+YouTube's bot check is per IP, so switching exit IP is the only real cure for
+the 429 storms. The scraper drives AmneziaWG directly:
+
+```cmd
+scraping vpn --list                 :: configs + current tunnel
+scraping vpn --connect NorwaySandefjordS13
+scraping vpn --rotate               :: tear down current, bring up the next
+scraping vpn --disconnect
+```
+
+Configs are read from `vpn.configs_dir` (`utils/vpn/*.conf`), the exe from
+`vpn.exe`. Rotation happens automatically when **3 consecutive videos fail
+transiently** (instead of the 5-minute cooldown), and optionally every
+`vpn.rotate_every_videos` videos.
+
+**It needs administrator rights.** `AmneziaWG.exe /installtunnelservice` fails
+with `Access is denied` for a normal user, and the scraper then falls back to
+the cooldown — it never crashes, it just keeps the current IP. Start it
+elevated:
+
+```powershell
+# PowerShell as Administrator
+.\tools\run-scraper.ps1 -Topic immortality -Seeds "5Dwcn2_-jBA,KES9yb3o-4Q" -Delay 4000
+```
+
+The tunnel name is remembered in `work/vpn_state.txt`, so a restart still knows
+what to tear down. `vpn.settle_ms` (default 6000) is the pause after switching,
+before the next request.
+
 ## Editing the vocabulary (important)
 
 `topic.stems` is the *filter*, not the history. Concretely:
