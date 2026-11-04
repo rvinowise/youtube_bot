@@ -6,6 +6,7 @@ open System.IO
 open System.Text
 open System.Text.Json
 open System.Threading.Tasks
+open Serilog
 
 type CaptionTrack =
     { Lang: string
@@ -119,10 +120,30 @@ module YtDlp =
     /// `-J` exits non-zero with "Requested format is not available" even though
     /// `automatic_captions` is fully populated. We never download media, only
     /// caption URLs, so those missing formats are irrelevant.
-    let private buildArgs (videoId: string) =
-        let cookies =
+    /// Round-robin over the configured browser profiles. One account per call,
+    /// so a penalty earned by one identity does not slow the others; a single
+    /// `cookies_from_browser` stays as the fallback when no list is configured.
+    let mutable private profileCursor = 0
+    let mutable private lastProfile = ""
+
+    let private cookiesArg () =
+        match Settings.cookieProfiles with
+        | [] ->
             if String.IsNullOrWhiteSpace Settings.cookiesFromBrowser then ""
             else sprintf "--cookies-from-browser \"%s\" " Settings.cookiesFromBrowser
+        | profiles ->
+            let i = profileCursor
+            profileCursor <- (profileCursor + 1) % profiles.Length
+            let profile = profiles.[i]
+
+            if profile <> lastProfile then
+                lastProfile <- profile
+                Log.Information("cookies: using {Profile} (profile {Index} of {Count})", profile, i + 1, profiles.Length)
+
+            sprintf "--cookies-from-browser \"%s\" " profile
+
+    let private buildArgs (videoId: string) =
+        let cookies = cookiesArg ()
 
         let extra =
             if String.IsNullOrWhiteSpace Settings.extraArgs then ""

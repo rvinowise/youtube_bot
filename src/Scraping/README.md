@@ -258,6 +258,31 @@ utils/yt-dlp.exe -4 --cookies-from-browser firefox --ignore-no-formats-error \
   --no-warnings --skip-download -J "https://www.youtube.com/watch?v=ALLkzW_Yzb0"
 ```
 
+### Rotating Firefox profiles
+
+One account takes all the penalties. To spread the load, list several
+logged-in profiles; every yt-dlp call takes the next one, round-robin:
+
+```json
+"cookies_profiles": [
+  "firefox:fjp7etbo.default-release",
+  "firefox:KF3JTX1H.Profile 1",
+  "firefox:qs9QsofY.Profile 2"
+]
+```
+
+**Display names are not directories.** yt-dlp reads everything after
+`firefox:` as a folder under `Profiles/`, so
+`--cookies-from-browser "firefox:me@gmail.com"` fails with *could not find
+firefox cookies database*. Use the folder names that `about:profiles` lists
+under *Profile Directory*; the account behind each one is not recorded
+anywhere in `profiles.ini`, so label them by hand.
+
+A non-empty `cookies_profiles` wins over `cookies_from_browser`; an empty list
+falls back to it. The log prints `cookies: using … (profile N of M)` each time
+the choice changes, and all three profiles are verified to carry
+`SID`/`LOGIN_INFO` on `.youtube.com`.
+
 - **Cookies defeat the bot check.** `firefox` works here; `chrome` fails with
   "Could not copy Chrome cookie database" while Chrome is running.
 - **Rate limit is real.** With `--delay 300` YouTube starts answering

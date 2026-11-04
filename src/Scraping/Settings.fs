@@ -30,6 +30,18 @@ module Settings =
     let cookiesFromBrowser =
         configuration.GetValue<string>("yt_dlp:cookies_from_browser", "")
 
+    /// Profiles to rotate between, in `--cookies-from-browser` syntax, one per
+    /// yt-dlp call. Firefox *display names* are not directories: yt-dlp treats
+    /// everything after `firefox:` as a folder under `Profile(s)/`, so these
+    /// must be the folder names shown by `about:profiles`
+    /// (e.g. `firefox:qs9QsofY.Profile 2`), not `firefox:me@gmail.com`.
+    /// Each account gets its own quota/penalty, which is the point.
+    let cookieProfiles =
+        configuration.GetSection("yt_dlp:cookies_profiles").GetChildren()
+        |> Seq.choose (fun c -> Option.ofObj c.Value)
+        |> Seq.filter (fun v -> not (String.IsNullOrWhiteSpace v))
+        |> List.ofSeq
+
     /// Escape hatch for any other yt-dlp flag, e.g. `--extractor-args ...`.
     let extraArgs =
         configuration.GetValue<string>("yt_dlp:extra_args", "")
