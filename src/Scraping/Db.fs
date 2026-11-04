@@ -157,6 +157,13 @@ alter table video add column if not exists channel_url    text not null default 
 alter table video add column if not exists channel_followers int not null default 0;
 alter table video add column if not exists origin         text not null default '';
 
+-- Everything below arrives in the same `yt-dlp -J` response as the title, so
+-- storing it costs nothing and re-fetching it later costs a full scan.
+alter table video add column if not exists description text   not null default '';
+alter table video add column if not exists view_count  bigint not null default 0;
+alter table video add column if not exists like_count  bigint not null default 0;
+alter table video add column if not exists tags        text[] not null default '{}';
+
 create index if not exists video_state_idx   on video (state);
 create index if not exists video_channel_idx on video (channel_id);
 
@@ -203,6 +210,10 @@ create table if not exists transcript_segment (
     text     text not null,
     primary key (video_id, idx)
 );
+
+-- `getSegments`, `saveSegments` and the coverage report all look up by video_id;
+-- without this the coverage query scans 12 M rows and times out.
+create index if not exists transcript_segment_video_idx on transcript_segment (video_id);
 
 create table if not exists transcript (
     video_id   text primary key references video(id) on delete cascade,
@@ -523,14 +534,16 @@ from unnest(@starts, @texts) with ordinality as t(start_ms, txt, ord)
             )
             |> ignore
 
+    /// Dapper cannot materialise a tuple, so read the two columns directly —
+    /// `getSegments` is on the hot path of `backfill` and `recheck`.
     let getSegments (videoId: string) : (int * string) list =
         use conn = openConnection()
+        use cmd = new NpgsqlCommand("select start_ms, text from transcript_segment where video_id = @id order by idx", conn)
+        cmd.Parameters.AddWithValue("id", videoId) |> ignore
+        use reader = cmd.ExecuteReader()
 
-        conn.Query<int * string>(
-            "select start_ms, text from transcript_segment where video_id = @id order by idx",
-            {| id = videoId |}
-        )
-        |> Seq.toList
+        [ while reader.Read() do
+              yield reader.GetInt32 0, reader.GetString 1 ]
 
     /// Videos of the topic whose hits have no timestamp (scored from flat text).
     let videosWithUntimedHits (topicName: string) (limit: int) : string list =
@@ -692,6 +705,28 @@ where f.topic_name = @topic and f.state = 'expanded' and v.channel_name = @chann
             {| limit = lim |}
         )
         |> Seq.toList
+
+    /// Fields that only the `-J` response carries. Saved on every scan so that a
+    /// later re-score, a new topic or a wider vocabulary never needs YouTube again.
+    let saveVideoMeta (videoId: string) (description: string) (views: int) (likes: int) (tags: string list) =
+        use conn = openConnection()
+
+        conn.Execute(
+            """
+update video set description = @description,
+                 view_count  = @views,
+                 like_count  = @likes,
+                 tags        = @tags,
+                 updated_at  = now()
+where id = @id
+""",
+            {| id = videoId
+               description = description
+               views = views
+               likes = likes
+               tags = Array.ofList tags |}
+        )
+        |> ignore
 
     /// The transcript was fetched earlier by another topic (or an earlier run),
     /// so yt-dlp never saw this video now. Still move it out of `pending`.
@@ -990,3 +1025,20 @@ where not exists (select 1 from hit h where h.video_id = t.video_id and h.topic_
         scalar "select count(*) from video",
         scalar "select count(*) from transcript",
         scalar "select count(*) from hit"
+
+
+    /// How much of the corpus can be re-scored without touching YouTube.
+    /// `transcripts` vs `withSegments` is the real measure of stored value:
+    /// a transcript without segments can still be searched, but a keyword found
+    /// in it has no timestamp.
+    let storageCoverage () =
+        use conn = openConnection()
+
+        let scalar (sql: string) = conn.ExecuteScalar<int64>(sql) |> int
+        let transcripts = scalar "select count(*) from transcript"
+        let withSegments = scalar "select count(distinct video_id) from transcript_segment"
+        let segments = scalar "select count(*) from transcript_segment"
+        let timedHits = scalar "select count(*) from hit where t_start > 0"
+        let untimedHits = scalar "select count(*) from hit where t_start = 0"
+        let described = scalar "select count(*) from video where description <> ''"
+        transcripts, withSegments, segments, timedHits, untimedHits, described

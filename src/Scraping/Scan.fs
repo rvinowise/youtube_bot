@@ -104,7 +104,10 @@ module Scan =
 
     // ------------------------------------------------------------ hits
 
-    let private hitsFromSegments (stems: string list) (exclude: string list) (segments: TranscriptSegment list) =
+    /// Hits with real timestamps. Public because `backfill` must use it too:
+    /// the segments are cached in the database, so re-scoring an old transcript
+    /// costs no YouTube request and still yields the exact second.
+    let hitsFromSegments (stems: string list) (exclude: string list) (segments: TranscriptSegment list) =
         [ for term in stems do
               match
                   segments
@@ -164,6 +167,10 @@ module Scan =
                     // frontier retry it later
                     return Error(Transient reason)
                 | Ok m ->
+                    // Save everything the fetch already paid for, before the
+                    // caption request — this is the only moment it is free.
+                    Db.saveVideoMeta videoId m.Description m.ViewCount m.LikeCount m.Tags
+
                     let! transcript = Transcript.fetch m.Captions
 
                     match transcript with

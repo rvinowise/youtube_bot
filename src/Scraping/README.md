@@ -65,6 +65,41 @@ hit        per topic: (topic_id, video_id, term, snippet, t_start)
 A video reached by two topics is fetched once and scored twice. The frontier is
 per topic, so two topics explore independently.
 
+## What is stored, and why it is enough
+
+Fetching YouTube is the expensive part, so everything a fetch pays for is kept:
+
+| Stored | Table | Why |
+|---|---|---|
+| transcript text | `transcript` | full-text search, `find` |
+| **transcript with timestamps** | `transcript_segment` (one row per caption cue) | re-score **any** vocabulary offline, with exact seconds |
+| title, channel, subs, duration, publish date | `video` | never re-fetch for display |
+| description, view/like counts, tags | `video` | free in the same `-J`, impossible later |
+| edges (child ← parent, depth, how discovered) | `frontier` | the graph itself |
+| hits | `hit` | a *materialised view* of segments × vocabulary |
+
+The last row matters: hits are disposable. They can be wiped and recomputed from
+`transcript_segment` in minutes with no network at all, which is what makes
+vocabulary changes cheap:
+
+```bash
+scraping backfill --topic immortality --reset
+```
+
+`backfill` uses cached segments when they exist and falls back to the flat text
+(no timestamp) only for transcripts fetched before segments were stored. `db`
+prints the coverage so the gap is visible:
+
+```
+reusable:    9087 of 14802 transcripts have segments (61%), 12479673 segment rows
+hits:        1625 timed, 184 untimed (90% have a timestamp)
+video meta:  0 of 74024 have a description
+```
+
+`recheck --topic T --limit N` upgrades old transcripts one by one: it re-fetches
+captions, stores the missing segments and rewrites the hits with timestamps.
+Run it overnight, not on every scan.
+
 ## Commands
 
 | Command | What it does |

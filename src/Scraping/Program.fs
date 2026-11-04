@@ -282,11 +282,29 @@ let private backfillCommand (args: string list) : Task<int> =
 
             let mutable total = 0
 
+            let mutable timed = 0
+            let mutable untimed = 0
+
             for t in rows do
-                let hits = Scan.hitsFromText stems exclude t.text
+                // Prefer the cached segments: re-scoring costs no YouTube call and
+                // keeps real timestamps. Only transcripts fetched before segments
+                // were stored fall back to the flat text (t_start = 0).
+                let segments =
+                    Db.getSegments t.video_id
+                    |> List.map (fun (ms, text) -> { StartMs = ms; Text = text })
+
+                let hits =
+                    if segments.IsEmpty then
+                        untimed <- untimed + 1
+                        Scan.hitsFromText stems exclude t.text
+                    else
+                        timed <- timed + 1
+                        Scan.hitsFromSegments stems exclude segments
+
                 Db.insertHits topicName t.video_id hits
                 total <- total + hits.Length
 
+            Console.WriteLine(sprintf "timed transcripts: %d, flat fallback: %d" timed untimed)
             Console.WriteLine(sprintf "inserted hits: %d" total)
             return 0
     }
@@ -605,12 +623,24 @@ let private dbCommand (_args: string list) : Task<int> =
         Db.init Settings.connectionString
         Db.migrate ()
         let topics, frontier, videos, transcripts, hits = Db.stats ()
+        let tr, withSegs, segRows, timed, untimed, described = Db.storageCoverage ()
         Console.WriteLine "connection:  ok"
         Console.WriteLine(sprintf "topics:      %d" topics)
         Console.WriteLine(sprintf "frontier:    %d" frontier)
         Console.WriteLine(sprintf "videos:      %d" videos)
         Console.WriteLine(sprintf "transcripts: %d" transcripts)
         Console.WriteLine(sprintf "hits:        %d" hits)
+        Console.WriteLine()
+
+        Console.WriteLine(
+            sprintf "reusable:    %d of %d transcripts have segments (%.0f%%), %d segment rows" withSegs tr (100.0 * float withSegs / float (max 1 tr)) segRows
+        )
+
+        Console.WriteLine(
+            sprintf "hits:        %d timed, %d untimed (%.0f%% have a timestamp)" timed untimed (100.0 * float timed / float (max 1 (timed + untimed)))
+        )
+
+        Console.WriteLine(sprintf "video meta:  %d of %d have a description" described videos)
         return 0
     }
 

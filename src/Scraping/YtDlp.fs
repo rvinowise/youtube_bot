@@ -22,6 +22,12 @@ type VideoMeta =
       /// Subscriber count at scan time. 0 when YouTube hides it.
       Followers: int
       UploadDate: string
+      /// Everything below is free in the same `-J` response and impossible to
+      /// recover later without scanning the video again — so it is stored.
+      Description: string
+      ViewCount: int
+      LikeCount: int
+      Tags: string list
       Captions: CaptionTrack list }
 
 /// Thin wrapper around utils/yt-dlp.exe.
@@ -172,6 +178,13 @@ module YtDlp =
                     use doc = JsonDocument.Parse stdout
                     let root = doc.RootElement
 
+                    let tags =
+                        match root.TryGetProperty "tags" with
+                        | true, arr when arr.ValueKind = JsonValueKind.Array ->
+                            [ for t in arr.EnumerateArray() do
+                                  if t.ValueKind = JsonValueKind.String then yield t.GetString() ]
+                        | _ -> []
+
                     return
                         Ok
                             { Id = asString root "id"
@@ -181,6 +194,10 @@ module YtDlp =
                               ChannelName = asString root "channel"
                               Followers = asInt root "channel_follower_count"
                               UploadDate = asString root "upload_date"
+                              Description = asString root "description"
+                              ViewCount = asInt root "view_count"
+                              LikeCount = asInt root "like_count"
+                              Tags = tags
                               Captions = parseCaptions root }
                 with e ->
                     return Error e.Message
