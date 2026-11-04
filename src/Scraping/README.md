@@ -190,6 +190,20 @@ empty `automatic_captions`. Do not set `--extractor-args
 youtube:player_client=...` unless you want no captions; the default client with
 cookies returns all 150+ caption languages.
 
+Measured, because this keeps being suggested: adding
+`--extractor-args "youtube:player_client=ios,android,web"` to the exact command
+above returns `automatic_captions` with **0 languages** (33,854-byte JSON,
+4 formats), i.e. every video becomes "no captions".
+
+Likewise, feeding the scraper's `HttpClient` the browser's cookies — the
+"identity mismatch" theory — does not help: on the same signed caption URL,
+`curl` with no cookies got 429 (1,103-byte "Sorry" page), the app's own
+`CONSENT=YES+1; SOCS=CAI` got the same 429, and with Firefox's cookies (all
+121, a youtube-only subset of 22, an auth-only subset of 43, or just the 3
+visitor cookies) Google answered **400 "malformed or illegal request"**, not
+200. The anonymous client is the one that works, which is why the crawler has
+downloaded 6,000+ transcripts with two cookies.
+
 **Never use the `captionTracks` URL from the watch page.** It is stale and
 returns `200` with a zero-byte body. Only the URL from a fresh `yt-dlp -J`
 response works.
@@ -211,10 +225,16 @@ listed with its exact command and its exact captured response in
 A video without captions is still walked: the whole point is the graph, not the
 transcript.
 
-Transient failures back off exponentially (`attempts² × 30 s` → 30 s, 2 min,
-4.5 min, 8 min) instead of hammering the same video. While everything queued is
-waiting out its backoff, the scanner prints `backoff, N queued` and keeps the
-process alive for up to 15 minutes.
+Transient failures back off exponentially — `attempts² × scan.retry_base_seconds`
+(default 120 s, i.e. 2, 8, 18 and 32 minutes). The old base of 30 s put the
+whole 5-attempt budget inside 15 minutes, shorter than the block it was waiting
+for, so a good video could end up `failed`. While everything queued is waiting
+out its backoff, the scanner prints `backoff, N queued` and keeps the process
+alive for up to 15 minutes.
+
+The scan delay now carries ±30 % jitter ([`Http.delayJitter`](Http.fs:89)): a
+metronome of exactly 4000 ms between videos is one more thing that makes the
+crawler look automated, and the jitter is free.
 
 When a video that already has a cached transcript is reached again, it is
 marked `done` without another yt-dlp call.

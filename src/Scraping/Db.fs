@@ -455,7 +455,7 @@ returning topic_name, video_id, depth, parent_id, state, attempts, priority
         use conn = openConnection()
 
         let state = if attempts >= 5 then "failed" else "queued"
-        let delaySeconds = attempts * attempts * 30
+        let delaySeconds = attempts * attempts * Settings.retryBaseSeconds
 
         conn.Execute(
             """

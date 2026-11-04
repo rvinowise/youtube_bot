@@ -57,6 +57,13 @@ module Settings =
     let vpnSettleMs =
         configuration.GetValue<int>("vpn:settle_ms", 6000)
 
+    /// Backoff base for transient failures: `attempts² × base` seconds, so the
+    /// retries land at 2, 8, 18 and 32 minutes. The old base of 30 s put the
+    /// whole 5-attempt budget inside 15 minutes — shorter than the block it was
+    /// waiting for, which turned a perfectly good video into `failed`.
+    let retryBaseSeconds =
+        configuration.GetValue<int>("scan:retry_base_seconds", 120)
+
     /// Name of this scraping node, stored on every video it discovers. Several
     /// machines can scrape into separate databases and be merged later; this is
     /// what keeps "which machine found this" answerable after the merge.

@@ -423,7 +423,8 @@ module Scan =
                         let! _ = Vpn.rotate ()
                         ()
 
-                    do! Http.delay options.DelayMs
+                    // ±30% so the crawl does not look like a metronome
+                    do! Http.delayJitter options.DelayMs (options.DelayMs / 3)
 
             Console.WriteLine()
             heartbeat ()
