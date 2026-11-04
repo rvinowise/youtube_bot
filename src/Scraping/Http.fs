@@ -5,49 +5,28 @@ open System.Net
 open System.Net.Http
 open System.Text
 open System.Threading.Tasks
-open System.IO
 
 let userAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-// Extract session cookies via yt-dlp to align HttpClient identity with your browser context
-let private discoverBrowserCookies () : string =
-    try
-        let cookiesFile = Path.Combine(Path.GetTempPath(), "yt_scraper_cookies.txt")
-        // Invokes yt-dlp to cleanly pull decrypted cookies out of Firefox's locked profile
-        let psi = 
-            System.Diagnostics.ProcessStartInfo(
-                FileName = "yt-dlp.exe", 
-                Arguments = sprintf "--cookies-from-browser firefox --cookies \"%s\" --version" cookiesFile,
-                RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
-            )
-        use proc = System.Diagnostics.Process.Start(psi)
-        proc.WaitForExit()
-        
-        if File.Exists(cookiesFile) then
-            let lines = File.ReadAllLines(cookiesFile)
-            // Filter out comments and format into a standard Cookie header string
-            let cookiePairs = 
-                lines 
-                |> Array.filter (fun line -> not (line.StartsWith("#")) && not (String.IsNullOrWhiteSpace line))
-                |> Array.choose (fun line ->
-                    let parts = line.Split('\t')
-                    if parts.Length >= 7 then Some (sprintf "%s=%s" parts.[5] parts.[6]) else None)
-            File.Delete(cookiesFile) // Clean up temp storage
-            String.concat "; " cookiePairs
-        else
-            "CONSENT=YES+1; SOCS=CAI"
-    with _ -> 
-        "CONSENT=YES+1; SOCS=CAI" // Fallback to safe defaults if browser is heavily locked
-
+/// Cookies are deliberately *not* taken from the browser.
+///
+/// The "align the identity" idea fails twice over. `yt-dlp --cookies-from-browser
+/// firefox --cookies f --version` writes no file at all (`--version` exits before
+/// any request is made), so the extraction shown above always falls back. And
+/// when the cookies are obtained properly — a real `--simulate` run does write
+/// 121 of them — sending them to a signed `timedtext` URL makes things worse:
+/// Google answers 400 "malformed or illegal request" instead of 200, because the
+/// URL is bound to the visitor identity that generated it, not to the account.
+///
+/// What works is the anonymous client: these two consent cookies have pulled
+/// 6,000+ transcripts, while the same URL with any browser-cookie header fails.
+/// Keep it that way. See README "Getting past YouTube" for the measurements.
 let private client =
-    let handler = new HttpClientHandler(UseCookies = false) // Prevent default container overriding manually passed cookies
-    let c = new HttpClient(handler, Timeout = TimeSpan.FromSeconds 60.0)
+    let c = new HttpClient(Timeout = TimeSpan.FromSeconds 60.0)
     c.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", userAgent) |> ignore
     c.DefaultRequestHeaders.TryAddWithoutValidation("Accept-Language", "ru-RU,ru;q=0.9,en;q=0.8") |> ignore
-    
-    let activeSessionCookies = discoverBrowserCookies()
-    c.DefaultRequestHeaders.TryAddWithoutValidation("Cookie", activeSessionCookies) |> ignore
+    c.DefaultRequestHeaders.TryAddWithoutValidation("Cookie", "CONSENT=YES+1; SOCS=CAI") |> ignore
     c
 
 let private readUtf8 (resp: HttpResponseMessage) : Task<string> =
@@ -127,12 +106,4 @@ let delayJitter (ms: int) (spreadMs: int) : Task =
     let delta = if spread = 0 then 0 else Random.Shared.Next(-spread, spread + 1)
     Task.Delay(max 0 (ms + delta))
 
-/// Introduces variable timing anomalies to disrupt rhythmic request pattern matching
-let delayWithJitter (baseMs: int) (maxWindowMs: int) : Task =
-    task {
-        let rand = Random()
-        let sleepDuration = baseMs + rand.Next(0, maxWindowMs)
-        let! _ = Task.Delay sleepDuration
-        return ()
-    }
 
