@@ -1,3 +1,15 @@
+# Goal of this project
+
+to find vloggers who talk about physical immortality, their desire to radically extend their life,
+cryonics, or something similar, from the domain of immortalism and transhumanism. the most interesting findings are vloggers
+who couldn't be found by simply querying youtube with transhumanism-related keywords. e.g., a car mechanic mentioning
+he wants to live forever.
+
+small channels are more interesting, because we can influence them more easily.
+channels whose topic is not transhumanism are more interesting because it makes sense to influence them and sway them
+towards transhumanism.
+
+
 # Scraping — endless BFS over YouTube's recommendation graph
 
 Walks the "related videos" graph from a seed video, forever, storing every
