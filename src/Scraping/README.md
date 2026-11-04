@@ -194,6 +194,11 @@ cookies returns all 150+ caption languages.
 returns `200` with a zero-byte body. Only the URL from a fresh `yt-dlp -J`
 response works.
 
+Every request the project makes — the one yt-dlp call, the watch page, search,
+channel pages, InnerTube continuations, oEmbed, thumbnails and timedtext — is
+listed with its exact command and its exact captured response in
+[`YOUTUBE-FETCHES.md`](YOUTUBE-FETCHES.md).
+
 ## Failure handling
 
 | Situation | Behaviour |
