@@ -407,17 +407,23 @@ let private recheckCommand (args: string list) : Task<int> =
 let private vpnCommand (args: string list) : Task<int> =
     task {
         let confs = Vpn.configs ()
-        let current = Vpn.current ()
+        let up = Vpn.active ()
+
+        let report () =
+            match up with
+            | [] -> Console.WriteLine "active:   (none)"
+            | xs -> Console.WriteLine(sprintf "active:   %s" (String.concat ", " xs))
 
         if flag args "--list" || args.IsEmpty then
             Console.WriteLine(sprintf "exe:      %s (exists: %b)" Settings.vpnExe (File.Exists Settings.vpnExe))
+            Console.WriteLine(sprintf "awg:      %s (exists: %b)" "awg.exe" (File.Exists(Path.Combine(Path.GetDirectoryName Settings.vpnExe, "awg.exe"))))
             Console.WriteLine(sprintf "configs:  %s" Settings.vpnConfigsDir)
             Console.WriteLine(sprintf "enabled:  %b" Settings.vpnEnabled)
+            report ()
 
             for c in confs do
                 Console.WriteLine(sprintf "  %s" (Vpn.tunnelName c))
 
-            Console.WriteLine(sprintf "current:  %s" (defaultArg current "(none)"))
             return 0
         elif flag args "--rotate" then
             let! result = Vpn.rotate ()
@@ -430,35 +436,24 @@ let private vpnCommand (args: string list) : Task<int> =
                 Console.WriteLine(sprintf "rotation failed: %s" reason)
                 return 1
         elif flag args "--disconnect" then
-            match current with
-            | None ->
-                Console.WriteLine "no tunnel recorded"
+            if up.IsEmpty then
+                Console.WriteLine "nothing to disconnect"
                 return 0
-            | Some name ->
-                let! result = Vpn.disconnect name
-
-                match result with
-                | Ok() ->
-                    Console.WriteLine(sprintf "disconnected %s" name)
-                    return 0
-                | Error reason ->
-                    Console.WriteLine(sprintf "disconnect failed: %s" reason)
-                    return 1
+            else
+                let left = Vpn.disconnectAll ()
+                Console.WriteLine(sprintf "disconnected %s, still up: %d" (String.concat ", " up) left)
+                return 0
         else
             let wanted = valueOf args "--connect" ""
 
-            let conf =
-                confs
-                |> List.tryFind (fun c -> Vpn.tunnelName c = wanted || c = wanted)
+            let conf = confs |> List.tryFind (fun c -> Vpn.tunnelName c = wanted || c = wanted)
 
             match conf with
             | None ->
                 Console.WriteLine(sprintf "no such config: %s (try --list)" wanted)
                 return 1
             | Some c ->
-                let! result = Vpn.connect c
-
-                match result with
+                match Vpn.connect c with
                 | Ok name ->
                     Console.WriteLine(sprintf "connected %s" name)
                     return 0

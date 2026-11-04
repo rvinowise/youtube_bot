@@ -298,9 +298,29 @@ elevated:
 .\tools\run-scraper.ps1 -Topic immortality -Seeds "5Dwcn2_-jBA,KES9yb3o-4Q" -Delay 4000
 ```
 
-The tunnel name is remembered in `work/vpn_state.txt`, so a restart still knows
-what to tear down. `vpn.settle_ms` (default 6000) is the pause after switching,
-before the next request.
+The truth about which tunnel is up comes from `awg show interfaces`, never from
+our own bookkeeping: the tunnel may have been installed by the GUI or by hand,
+and a stale name in a state file is worse than no name at all. Every operation
+first tears down **everything** that is up and only then installs one tunnel —
+two interfaces at once both claim `0.0.0.0/0` and kill connectivity outright.
+Both the uninstall and the install are polled (`until` in [`Vpn.fs`](src/Scraping/Vpn.fs)),
+because the service tears down and comes up asynchronously; a fixed sleep is a
+race that leaves the machine with no tunnel.
+
+That last point matters when the machine is reached *over* the tunnel: a manual
+switch from an interactive session can cut the session before the new tunnel is
+up. Rotation inside the scraper is safe (the process outlives the switch), but
+for a manual switch start it detached so it survives losing the connection:
+
+```powershell
+Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass',`
+  '-File','C:\prj\browsing\work\switch-vpn.ps1',`
+  '-Conf','C:\prj\browsing\utils\vpn\NorwaySandefjordS13.conf' -WindowStyle Hidden
+```
+
+`work\switch-vpn.log` records what was up, what was installed, and the result.
+`vpn.settle_ms` (default 6000) is the pause after the interface appears, before
+the next request, letting routes and DNS settle.
 
 ## Editing the vocabulary (important)
 
