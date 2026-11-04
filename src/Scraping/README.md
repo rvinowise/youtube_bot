@@ -314,7 +314,7 @@ for a manual switch start it detached so it survives losing the connection:
 
 ```powershell
 Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass',`
-  '-File','C:\prj\browsing\work\switch-vpn.ps1',`
+  '-File','C:\prj\browsing\tools\switch-vpn.ps1',`
   '-Conf','C:\prj\browsing\utils\vpn\NorwaySandefjordS13.conf' -WindowStyle Hidden
 ```
 
