@@ -462,11 +462,10 @@ returning topic_name, video_id, depth, parent_id, state, attempts, priority
     /// After a transient failure: retry with exponential backoff, give up after
     /// 5 attempts. The backoff matters: a 429 would otherwise be retried at
     /// once, burn the attempt budget and mark a perfectly good video `failed`.
-    let markFrontierRetry (topicName: string) (videoId: string) (attempts: int) =
+    let markFrontierRetry (topicName: string) (videoId: string) (attempts: int) delay_seconds =
         use conn = openConnection()
 
         let state = if attempts >= 5 then "failed" else "queued"
-        let delaySeconds = attempts * attempts * Settings.retryBaseSeconds
 
         conn.Execute(
             """
@@ -476,7 +475,7 @@ set state = @state,
 where topic_name = @topic and video_id = @video
 """,
             {| state = state
-               delay = delaySeconds
+               delay = delay_seconds
                topic = topicName
                video = videoId |}
         )
@@ -643,10 +642,8 @@ where id = @id
           url: string }
 
     /// Channels whose subscriber count we never learned, busiest first.
-    let channelsWithoutSubs (limit: int) : ChannelNoSubs list =
+    let channels_without_subs (limit: int option) : ChannelNoSubs list =
         use conn = openConnection()
-
-        let lim = if limit <= 0 then Nullable<int>() else Nullable limit
 
         conn.Query<ChannelNoSubs>(
             """
@@ -657,7 +654,7 @@ group by channel_name
 order by count(*) desc
 limit @limit
 """,
-            {| limit = lim |}
+            {| limit = Option.toNullable limit  |}
         )
         |> Seq.toList
 
@@ -825,7 +822,6 @@ where v.state in ('failed', 'no_captions')
 
         n
 
-    // ------------------------------------------------------------ hits
 
     /// Insert the hits of one video for one topic. Idempotent.
     let insertHits (topicName: string) (videoId: string) (hits: (string * string * int) list) =

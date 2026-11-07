@@ -85,7 +85,7 @@ module Transcript =
 
                 for t in candidates do
                     if go then
-                        let! response = Http.getStringStatus t.Url
+                        let! response = http.getStringStatus t.Url
 
                         match response with
                         | Error 429 ->

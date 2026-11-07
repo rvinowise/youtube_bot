@@ -7,7 +7,7 @@ open Serilog
 
 /// Configuration + logging, mirroring the twitter_bot layout:
 /// appsettings.json next to the binary, Serilog with a compact JSON file sink.
-module Settings =
+module settings =
 
     let private basePath = AppContext.BaseDirectory
 

@@ -8,18 +8,7 @@ open System.Threading
 open System.Threading.Tasks
 open Serilog
 
-/// Rotates AmneziaWG tunnels so YouTube sees a different exit IP.
-///
-/// The source of truth is `awg show interfaces`, never our own bookkeeping: the
-/// tunnel may have been installed by the GUI or by hand before we started.
-/// Two active interfaces at once break routing completely (both claim
-/// 0.0.0.0/0), so every operation first tears down whatever is up and only then
-/// installs one tunnel.
-///
-/// `AmneziaWG.exe /installtunnelservice` needs administrator rights; when the
-/// scraper is not elevated the calls fail with "Access is denied" and the crawl
-/// simply continues on the current IP — rotation is an optimisation, never a
-/// requirement.
+
 module Vpn =
 
     /// `awg.exe` lives next to `AmneziaWG.exe`.

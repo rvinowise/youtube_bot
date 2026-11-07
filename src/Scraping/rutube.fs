@@ -1,6 +1,6 @@
 /// Rutube scraping. Rutube exposes a public JSON search API (no token needed),
 /// which makes it much friendlier than YouTube for this kind of work.
-module Scraping.Rutube
+module Scraping.rutube
 
 open System
 open System.Globalization
@@ -27,7 +27,7 @@ let search (query: string) (limit: int) : Task<Video list> =
     task {
         let url =
             sprintf "https://rutube.ru/api/search/video/?query=%s&limit=%d" (Uri.EscapeDataString query) limit
-        let! bodyOpt = Http.tryGetString url
+        let! bodyOpt = http.tryGetString url
         match bodyOpt with
         | None -> return []
         | Some body ->
@@ -68,7 +68,7 @@ let search (query: string) (limit: int) : Task<Video list> =
 /// Rutube's API has no subscriber count; video count is the size proxy.
 let channelVideoCount (authorId: string) : Task<int> =
     task {
-        let! bodyOpt = Http.tryGetString (sprintf "https://rutube.ru/api/video/person/%s/" authorId)
+        let! bodyOpt = http.tryGetString (sprintf "https://rutube.ru/api/video/person/%s/" authorId)
         match bodyOpt with
         | None -> return 0
         | Some body ->

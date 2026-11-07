@@ -79,6 +79,11 @@ let private intOf (args: string list) (name: string) (fallback: int) =
     | true, n -> n
     | _ -> fallback
 
+let private some_int_of (args: string list) (name: string)=
+    match Int32.TryParse(valueOf args name "") with
+    | true, n -> Some n
+    | _ -> None
+
 let private printTable (headers: string list) (rows: string list list) =
     if rows.IsEmpty then
         Console.WriteLine "  (no rows)"
@@ -97,18 +102,17 @@ let private printTable (headers: string list) (rows: string list list) =
         for row in rows do
             Console.WriteLine(line row)
 
-// ---------------------------------------------------------------- commands
 
 let private findBloggers (args: string list) : Task<int> =
     task {
         let queries =
-            (valueOf args "--queries" (String.concat "," BloggerFinder.defaultQueries)).Split(',')
+            (valueOf args "--queries" (String.concat "," find_bloggers.defaultQueries)).Split(',')
             |> Array.map (fun s -> s.Trim())
             |> Array.filter (String.IsNullOrWhiteSpace >> not)
             |> List.ofArray
 
         let options =
-            { BloggerFinder.defaultOptions with
+            { find_bloggers.defaultOptions with
                 Queries = queries
                 Source = valueOf args "--source" "both"
                 MaxPerQuery = intOf args "--max-per-query" 30
@@ -119,7 +123,7 @@ let private findBloggers (args: string list) : Task<int> =
                 SkipChannelScan = flag args "--no-scan" }
 
         Console.WriteLine(sprintf "queries: %d | source: %s" options.Queries.Length options.Source)
-        let! candidates, scanned = BloggerFinder.run options
+        let! candidates, scanned = find_bloggers.run options
 
         Console.WriteLine(sprintf "\ncandidates: %d" candidates.Length)
         printTable
@@ -261,7 +265,7 @@ let private verify (args: string list) : Task<int> =
 
 let private backfillCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         let topicName = valueOf args "--topic" ""
 
         if topicName = "" then
@@ -296,10 +300,10 @@ let private backfillCommand (args: string list) : Task<int> =
                 let hits =
                     if segments.IsEmpty then
                         untimed <- untimed + 1
-                        Scan.hitsFromText stems exclude t.text
+                        scan.hits_from_text stems exclude t.text
                     else
                         timed <- timed + 1
-                        Scan.hitsFromSegments stems exclude segments
+                        scan.hitsFromSegments stems exclude segments
 
                 Db.insertHits topicName t.video_id hits
                 total <- total + hits.Length
@@ -313,7 +317,7 @@ let private backfillCommand (args: string list) : Task<int> =
 /// Uses the public oEmbed endpoint: no cookies, no bot check, ~200 ms each.
 let private backfillTitlesCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         Db.migrate ()
 
         let limit = intOf args "--limit" 0
@@ -339,7 +343,7 @@ let private backfillTitlesCommand (args: string list) : Task<int> =
                 Console.WriteLine(sprintf "\n  %s: %s" id reason)
 
             Console.Write(sprintf "\r[%d/%d] ok %d | failed %d | %s" i ids.Length ok failed id)
-            do! Http.delay delay
+            do! http.delay delay
 
         Console.WriteLine()
         Console.WriteLine(sprintf "titles filled: %d, failed: %d" ok failed)
@@ -350,12 +354,12 @@ let private backfillTitlesCommand (args: string list) : Task<int> =
 /// the frontier is untouched, only `video.channel_followers` is updated.
 let private backfillSubsCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         Db.migrate ()
 
-        let limit = intOf args "--limit" 0
+        let limit = some_int_of args "--limit"
         let delay = intOf args "--delay" 200
-        let rows = Db.channelsWithoutSubs limit
+        let rows = Db.channels_without_subs limit
 
         Console.WriteLine(sprintf "channels without subs: %d" rows.Length)
 
@@ -374,7 +378,7 @@ let private backfillSubsCommand (args: string list) : Task<int> =
             | _ -> failed <- failed + 1
 
             Console.Write(sprintf "\r[%d/%d] ok %d | failed %d | %s" i rows.Length ok failed r.name)
-            do! Http.delay delay
+            do! http.delay delay
 
         Console.WriteLine()
         Console.WriteLine(sprintf "subs filled: %d, unknown: %d" ok failed)
@@ -385,7 +389,7 @@ let private backfillSubsCommand (args: string list) : Task<int> =
 /// them again from segments. Network-bound, one yt-dlp call per video.
 let private recheckCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         Db.migrate ()
 
         let topicName = valueOf args "--topic" ""
@@ -400,7 +404,7 @@ let private recheckCommand (args: string list) : Task<int> =
             let limit = intOf args "--limit" 0
             let delay = intOf args "--delay" 300
             let ids = Db.videosWithUntimedHits topicName limit
-            let exe = YtDlp.resolvePath Settings.ytDlpPath
+            let exe = YtDlp.resolvePath settings.ytDlpPath
 
             Console.WriteLine(sprintf "videos with untimed hits: %d" ids.Length)
 
@@ -409,80 +413,20 @@ let private recheckCommand (args: string list) : Task<int> =
 
             for id in ids do
                 i <- i + 1
-                let! refreshed = Scan.refreshVideo exe topicName stems exclude id
+                let! refreshed = scan.refreshVideo exe topicName stems exclude id
                 if refreshed then ok <- ok + 1
                 Console.Write(sprintf "\r[%d/%d] refreshed %d | %s" i ids.Length ok id)
-                do! Http.delay delay
+                do! http.delay delay
 
             Console.WriteLine()
             Console.WriteLine(sprintf "refreshed: %d of %d" ok ids.Length)
             return 0
     }
 
-/// Inspect and drive the AmneziaWG tunnels used for IP rotation.
-/// Installing a tunnel needs administrator rights; without them the command
-/// reports the error instead of failing silently.
-let private vpnCommand (args: string list) : Task<int> =
-    task {
-        let confs = Vpn.configs ()
-        let up = Vpn.active ()
-
-        let report () =
-            match up with
-            | [] -> Console.WriteLine "active:   (none)"
-            | xs -> Console.WriteLine(sprintf "active:   %s" (String.concat ", " xs))
-
-        if flag args "--list" || args.IsEmpty then
-            Console.WriteLine(sprintf "exe:      %s (exists: %b)" Settings.vpnExe (File.Exists Settings.vpnExe))
-            Console.WriteLine(sprintf "awg:      %s (exists: %b)" "awg.exe" (File.Exists(Path.Combine(Path.GetDirectoryName Settings.vpnExe, "awg.exe"))))
-            Console.WriteLine(sprintf "configs:  %s" Settings.vpnConfigsDir)
-            Console.WriteLine(sprintf "enabled:  %b" Settings.vpnEnabled)
-            report ()
-
-            for c in confs do
-                Console.WriteLine(sprintf "  %s" (Vpn.tunnelName c))
-
-            return 0
-        elif flag args "--rotate" then
-            let! result = Vpn.rotate ()
-
-            match result with
-            | Ok name ->
-                Console.WriteLine(sprintf "rotated to %s" name)
-                return 0
-            | Error reason ->
-                Console.WriteLine(sprintf "rotation failed: %s" reason)
-                return 1
-        elif flag args "--disconnect" then
-            if up.IsEmpty then
-                Console.WriteLine "nothing to disconnect"
-                return 0
-            else
-                let left = Vpn.disconnectAll ()
-                Console.WriteLine(sprintf "disconnected %s, still up: %d" (String.concat ", " up) left)
-                return 0
-        else
-            let wanted = valueOf args "--connect" ""
-
-            let conf = confs |> List.tryFind (fun c -> Vpn.tunnelName c = wanted || c = wanted)
-
-            match conf with
-            | None ->
-                Console.WriteLine(sprintf "no such config: %s (try --list)" wanted)
-                return 1
-            | Some c ->
-                match Vpn.connect c with
-                | Ok name ->
-                    Console.WriteLine(sprintf "connected %s" name)
-                    return 0
-                | Error reason ->
-                    Console.WriteLine(sprintf "connect failed: %s" reason)
-                    return 1
-    }
 
 let private channelsCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         let topic = valueOf args "--topic" ""
         let term = valueOf args "--term" ""
         let limit = intOf args "--limit" 50
@@ -514,7 +458,7 @@ let private channelsCommand (args: string list) : Task<int> =
 
 let private hitsCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         let topic = valueOf args "--topic" ""
         let term = valueOf args "--term" ""
         let limit = intOf args "--limit" 100
@@ -541,7 +485,7 @@ let private hitsCommand (args: string list) : Task<int> =
 
 let private topicsCommand (_args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         Db.migrate ()
         let rows = Db.listTopics ()
 
@@ -562,7 +506,7 @@ let private topicsCommand (_args: string list) : Task<int> =
 
 let private videosCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         let state = valueOf args "--state" ""
         let term = valueOf args "--term" ""
         let limit = intOf args "--limit" 50
@@ -585,7 +529,7 @@ let private videosCommand (args: string list) : Task<int> =
 
 let private sqlCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         let sql = valueOf args "--query" ""
 
         if sql = "" then
@@ -600,7 +544,7 @@ let private sqlCommand (args: string list) : Task<int> =
 
 let private findCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         let term = valueOf args "--term" ""
 
         if term = "" then
@@ -620,7 +564,7 @@ let private findCommand (args: string list) : Task<int> =
 
 let private dbCommand (_args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         Db.migrate ()
         let topics, frontier, videos, transcripts, hits = Db.stats ()
         let tr, withSegs, segRows, timed, untimed, described = Db.storageCoverage ()
@@ -652,7 +596,7 @@ let private splitCsv (s: string) =
 
 let private requeueCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         Db.migrate ()
 
         let topic = valueOf args "--topic" ""
@@ -681,7 +625,7 @@ let private requeueCommand (args: string list) : Task<int> =
 
 let private scanCommand (args: string list) : Task<int> =
     task {
-        Db.init Settings.connectionString
+        Db.init settings.connectionString
         Db.migrate ()
 
         let topic = valueOf args "--topic" ""
@@ -724,11 +668,9 @@ let private scanCommand (args: string list) : Task<int> =
                     options.RelatedLimit
             )
 
-            do! Scan.run options
+            do! scan.run options
             return 0
     }
-
-// ---------------------------------------------------------------- entry point
 
 [<EntryPoint>]
 let main argv =
@@ -739,7 +681,7 @@ let main argv =
         | c :: tail -> c, tail
         | [] -> "", []
 
-    Settings.initLogging ()
+    settings.initLogging ()
 
     let work =
         match command with
@@ -753,7 +695,6 @@ let main argv =
         | "backfill-titles" -> backfillTitlesCommand rest
         | "backfill-subs" -> backfillSubsCommand rest
         | "recheck" -> recheckCommand rest
-        | "vpn" -> vpnCommand rest
         | "requeue" -> requeueCommand rest
         | "sql" -> sqlCommand rest
         | "find" -> findCommand rest

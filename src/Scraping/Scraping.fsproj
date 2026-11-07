@@ -12,18 +12,19 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="Domain.fs" />
-    <Compile Include="Settings.fs" />
-    <Compile Include="Http.fs" />
-    <Compile Include="Json.fs" />
-    <Compile Include="Db.fs" />
+    <ProjectReference Include="..\Domain\Domain.fsproj" />
+  </ItemGroup>
+  
+  <ItemGroup>
+    <Compile Include="settings.fs" />
+    <Compile Include="http.fs" />
+    <Compile Include="json.fs" />
     <Compile Include="YtDlp.fs" />
-    <Compile Include="Vpn.fs" />
-    <Compile Include="Transcript.fs" />
+    <Compile Include="transcript.fs" />
     <Compile Include="YouTube.fs" />
-    <Compile Include="Rutube.fs" />
-    <Compile Include="BloggerFinder.fs" />
-    <Compile Include="Scan.fs" />
+    <Compile Include="rutube.fs" />
+    <Compile Include="find_bloggers.fs" />
+    <Compile Include="scan.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

@@ -1,4 +1,4 @@
-module Scraping.Http
+module Scraping.http
 
 open System
 open System.Net

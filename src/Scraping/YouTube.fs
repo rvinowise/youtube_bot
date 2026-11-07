@@ -12,7 +12,7 @@ open System.Text.Json
 open System.Text.RegularExpressions
 open System.Threading.Tasks
 open Scraping
-open Scraping.Json
+open Scraping.json
 
 // ---------------------------------------------------------------- patterns
 
@@ -119,7 +119,7 @@ let private parseSearchPayload (query: string) (payload: string) : Video list =
 let search (query: string) (maxPages: int) : Task<Video list> =
     task {
         let url = "https://www.youtube.com/results?search_query=" + Uri.EscapeDataString query
-        let! html = Http.getString url
+        let! html = http.getString url
         let acc = ResizeArray<Video>(parseSearchPayload query html)
         let apiKey, clientVersion, visitor = InnerTube.session html
         let mutable token = longestToken html
@@ -128,13 +128,13 @@ let search (query: string) (maxPages: int) : Task<Video list> =
         while go && page < maxPages do
             page <- page + 1
             let body = InnerTube.continuationBody clientVersion visitor token.Value
-            let! json = Http.postJson (InnerTube.url "search" apiKey) body (InnerTube.headers clientVersion)
+            let! json = http.postJson (InnerTube.url "search" apiKey) body (InnerTube.headers clientVersion)
             let before = acc.Count
             acc.AddRange(parseSearchPayload query json)
             let next = longestToken json
             let stop = next.IsNone || next = token || acc.Count = before
             if stop then go <- false else token <- next
-            do! Http.delay 300
+            do! http.delay 300
         return List.ofSeq acc
     }
 
@@ -143,7 +143,7 @@ let search (query: string) (maxPages: int) : Task<Video list> =
 /// Subscriber/video counts from the channel "about" page.
 let channelInfo (channelId: string) : Task<ChannelInfo option> =
     task {
-        let! html = Http.tryGetString (sprintf "https://www.youtube.com/channel/%s/about" channelId)
+        let! html = http.tryGetString (sprintf "https://www.youtube.com/channel/%s/about" channelId)
         match html with
         | None -> return None
         | Some h ->
@@ -171,7 +171,7 @@ let channelSubs (idOrUrl: string) : Task<int option> =
             if idOrUrl.StartsWith "http" then idOrUrl.TrimEnd('/') + "/about"
             else sprintf "https://www.youtube.com/channel/%s/about" idOrUrl
 
-        let! html = Http.tryGetString url
+        let! html = http.tryGetString url
 
         match html with
         | None -> return None
@@ -199,7 +199,7 @@ let private collectVideoEntries (payload: string) (acc: ResizeArray<string * str
 /// Every video on a channel's "Videos" tab as (videoId, title), paginated.
 let channelVideos (channelId: string) (maxPages: int) : Task<(string * string) list> =
     task {
-        let! htmlOpt = Http.tryGetString (sprintf "https://www.youtube.com/channel/%s/videos" channelId)
+        let! htmlOpt = http.tryGetString (sprintf "https://www.youtube.com/channel/%s/videos" channelId)
         match htmlOpt with
         | None -> return []
         | Some html ->
@@ -212,13 +212,13 @@ let channelVideos (channelId: string) (maxPages: int) : Task<(string * string) l
             while go && page < maxPages do
                 page <- page + 1
                 let body = InnerTube.continuationBody clientVersion visitor token.Value
-                let! json = Http.postJson (InnerTube.url "browse" apiKey) body (InnerTube.headers clientVersion)
+                let! json = http.postJson (InnerTube.url "browse" apiKey) body (InnerTube.headers clientVersion)
                 let before = entries.Count
                 collectVideoEntries json entries
                 let next = longestToken json
                 let stop = next.IsNone || next = token || entries.Count = before
                 if stop then go <- false else token <- next
-                do! Http.delay 250
+                do! http.delay 250
             return List.ofSeq entries
     }
 
@@ -232,7 +232,7 @@ let channelTitles (channelId: string) (maxPages: int) : Task<string list> =
 /// Every Short on a channel's "Shorts" tab as (videoId, title).
 let channelShorts (channelId: string) (maxPages: int) : Task<(string * string) list> =
     task {
-        let! htmlOpt = Http.tryGetString (sprintf "https://www.youtube.com/channel/%s/shorts" channelId)
+        let! htmlOpt = http.tryGetString (sprintf "https://www.youtube.com/channel/%s/shorts" channelId)
         match htmlOpt with
         | None -> return []
         | Some html ->
@@ -258,13 +258,13 @@ let channelShorts (channelId: string) (maxPages: int) : Task<(string * string) l
             while go && page < maxPages do
                 page <- page + 1
                 let body = InnerTube.continuationBody clientVersion visitor token.Value
-                let! json = Http.postJson (InnerTube.url "browse" apiKey) body (InnerTube.headers clientVersion)
+                let! json = http.postJson (InnerTube.url "browse" apiKey) body (InnerTube.headers clientVersion)
                 let before = items.Count
                 collect json
                 let next = longestToken json
                 let stop = next.IsNone || next = token || items.Count = before
                 if stop then go <- false else token <- next
-                do! Http.delay 250
+                do! http.delay 250
             return List.ofSeq items
     }
 
@@ -272,7 +272,7 @@ let channelShorts (channelId: string) (maxPages: int) : Task<(string * string) l
 /// This is the edge set the BFS walks.
 let relatedVideos (videoId: string) (limit: int) : Task<(string * string) list> =
     task {
-        let! htmlOpt = Http.tryGetString (sprintf "https://www.youtube.com/watch?v=%s" videoId)
+        let! htmlOpt = http.tryGetString (sprintf "https://www.youtube.com/watch?v=%s" videoId)
 
         match htmlOpt with
         | None -> return []
@@ -299,7 +299,7 @@ let relatedVideos (videoId: string) (limit: int) : Task<(string * string) list> 
 /// Items of a playlist as (videoId, title).
 let playlistItems (playlistId: string) (maxPages: int) : Task<(string * string) list> =
     task {
-        let! htmlOpt = Http.tryGetString (sprintf "https://www.youtube.com/playlist?list=%s" playlistId)
+        let! htmlOpt = http.tryGetString (sprintf "https://www.youtube.com/playlist?list=%s" playlistId)
         match htmlOpt with
         | None -> return []
         | Some html ->
@@ -324,13 +324,13 @@ let playlistItems (playlistId: string) (maxPages: int) : Task<(string * string) 
             while go && page < maxPages do
                 page <- page + 1
                 let body = InnerTube.continuationBody clientVersion visitor token.Value
-                let! json = Http.postJson (InnerTube.url "browse" apiKey) body (InnerTube.headers clientVersion)
+                let! json = http.postJson (InnerTube.url "browse" apiKey) body (InnerTube.headers clientVersion)
                 let before = items.Count
                 collect json
                 let next = longestToken json
                 let stop = next.IsNone || next = token || items.Count = before
                 if stop then go <- false else token <- next
-                do! Http.delay 250
+                do! http.delay 250
             return List.ofSeq items
     }
 
@@ -345,7 +345,7 @@ let oembed (videoId: string) : Task<Result<string * string * string, string>> =
         let url =
             sprintf "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=%s&format=json" videoId
 
-        let! body = Http.tryGetString url
+        let! body = http.tryGetString url
 
         match body with
         | None -> return Error "oembed: no response (404 or network)"
@@ -377,7 +377,7 @@ let downloadThumbnail (videoId: string) (destDir: string) : Task<bool> =
             for name in [ "frame0"; "hq720"; "maxresdefault"; "hqdefault" ] do
                 if not ok then
                     let url = sprintf "https://i.ytimg.com/vi/%s/%s.jpg" videoId name
-                    let! bytes = Http.tryGetBytes url
+                    let! bytes = http.tryGetBytes url
                     match bytes with
                     | Some b when b.Length > 2000 ->
                         do! File.WriteAllBytesAsync(dest, b)

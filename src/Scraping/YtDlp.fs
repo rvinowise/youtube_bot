@@ -133,10 +133,10 @@ module YtDlp =
     let mutable private lastProfile = ""
 
     let private cookiesArg () =
-        match Settings.cookieProfiles with
+        match settings.cookieProfiles with
         | [] ->
-            if String.IsNullOrWhiteSpace Settings.cookiesFromBrowser then ""
-            else sprintf "--cookies-from-browser \"%s\" " Settings.cookiesFromBrowser
+            if String.IsNullOrWhiteSpace settings.cookiesFromBrowser then ""
+            else sprintf "--cookies-from-browser \"%s\" " settings.cookiesFromBrowser
         | profiles ->
             let i = profileCursor
             profileCursor <- (profileCursor + 1) % profiles.Length
@@ -152,8 +152,8 @@ module YtDlp =
         let cookies = cookiesArg ()
 
         let extra =
-            if String.IsNullOrWhiteSpace Settings.extraArgs then ""
-            else Settings.extraArgs.Trim() + " "
+            if String.IsNullOrWhiteSpace settings.extraArgs then ""
+            else settings.extraArgs.Trim() + " "
 
         sprintf
             "-4 %s--ignore-no-formats-error %s--no-warnings --skip-download -J \"https://www.youtube.com/watch?v=%s\""

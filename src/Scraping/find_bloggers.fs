@@ -5,7 +5,7 @@
 /// 3. Group by channel, drop channels that are too big.
 /// 4. Scan each surviving channel's titles for seed words.
 /// 5. Classify: Target / Dedicated / NoSeedHits.
-module Scraping.BloggerFinder
+module Scraping.find_bloggers
 
 open System
 open System.Threading.Tasks
@@ -81,11 +81,11 @@ let private collectHits (opt: Options) : Task<Video list * Video list> =
             if opt.Source = "yt" || opt.Source = "both" then
                 let! found = YouTube.search query 3
                 yt.AddRange(found |> List.truncate opt.MaxPerQuery)
-                do! Http.delay 400
+                do! http.delay 400
             if opt.Source = "rutube" || opt.Source = "both" then
-                let! found = Rutube.search query 30
+                let! found = rutube.search query 30
                 rt.AddRange(found |> List.truncate opt.MaxPerQuery)
-                do! Http.delay 300
+                do! http.delay 300
         return dedupe (List.ofSeq yt), dedupe (List.ofSeq rt)
     }
 
@@ -112,7 +112,7 @@ let private youtubeCandidates (opt: Options) (hits: Video list) : Task<Candidate
                       Sample = sampleOf videos
                       Url = sprintf "https://www.youtube.com/channel/%s" i.Id }
             | None -> ()
-            do! Http.delay 200
+            do! http.delay 200
         return List.ofSeq acc
     }
 
@@ -124,7 +124,7 @@ let private rutubeCandidates (opt: Options) (hits: Video list) : Task<Candidate 
             |> List.groupBy (fun v -> v.ChannelId)
         let acc = ResizeArray<Candidate>()
         for (channelId, videos) in groups do
-            let! count = Rutube.channelVideoCount channelId
+            let! count = rutube.channelVideoCount channelId
             acc.Add
                 { Source = "rutube"
                   ChannelId = channelId
@@ -136,7 +136,7 @@ let private rutubeCandidates (opt: Options) (hits: Video list) : Task<Candidate 
                   Matches = videos.Length
                   Sample = sampleOf videos
                   Url = sprintf "https://rutube.ru/video/person/%s/" channelId }
-            do! Http.delay 200
+            do! http.delay 200
         return List.ofSeq acc
     }
 

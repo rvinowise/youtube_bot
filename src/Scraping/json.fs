@@ -4,7 +4,7 @@
 /// deserialising it (the schema changes weekly), we split the raw text on
 /// renderer markers and pull fields with regexes. This is deliberately
 /// tolerant: a missing field yields `None`, never an exception.
-module Scraping.Json
+module Scraping.json
 
 open System
 open System.Globalization

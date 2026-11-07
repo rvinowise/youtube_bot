@@ -40,7 +40,7 @@ type Counters =
 /// be killed at any moment and resumed with the same command: it picks up the
 /// shallowest queued video and keeps going. There is no depth limit — you stop
 /// it yourself.
-module Scan =
+module scan =
 
     let private counters =
         { Topic = ""
@@ -54,16 +54,16 @@ module Scan =
           Current = ""
           StartedAt = DateTime.UtcNow }
 
-    let private heartbeatPath = Path.Combine(Settings.workDir, "progress.json")
+    let private heartbeatPath = Path.Combine(settings.workDir, "progress.json")
 
     let private render () =
         let c = counters
         let elapsed = max 0.001 (DateTime.UtcNow - c.StartedAt).TotalSeconds
-        let rate = float c.Expanded / elapsed
+        let videos_per_second =  elapsed / (float c.Expanded)
 
         let line =
             sprintf
-                "[%s] %s | depth %d | expanded %d | queued %d | caps %d | nocaps %d | hits %d | fail %d | %.2f/s | now: %s"
+                "[%s] %s | depth %d | expanded %d | queued %d | caps %d | nocaps %d | hits %d | fail %d | %.2f sec/video | now: %s"
                 (DateTime.Now.ToString "HH:mm:ss")
                 c.Topic
                 c.Depth
@@ -73,7 +73,7 @@ module Scan =
                 c.NoCaptions
                 c.Hits
                 c.Failed
-                rate
+                videos_per_second
                 c.Current
 
         Console.Write("\r" + line.PadRight(170))
@@ -97,12 +97,11 @@ module Scan =
                    rate = Math.Round(float c.Expanded / elapsed, 2)
                    current = c.Current |}
 
-            Directory.CreateDirectory Settings.workDir |> ignore
+            Directory.CreateDirectory settings.workDir |> ignore
             File.WriteAllText(heartbeatPath, JsonSerializer.Serialize payload)
         with e ->
             Log.Warning(e, "heartbeat failed")
 
-    // ------------------------------------------------------------ hits
 
     /// Hits with real timestamps. Public because `backfill` must use it too:
     /// the segments are cached in the database, so re-scoring an old transcript
@@ -122,7 +121,7 @@ module Scan =
               | _ -> () ]
 
     /// Same, but over a flat transcript where timestamps are gone.
-    let hitsFromText (stems: string list) (exclude: string list) (text: string) =
+    let hits_from_text (stems: string list) (exclude: string list) (text: string) =
         let low = text.ToLowerInvariant()
 
         [ for term in stems do
@@ -224,7 +223,7 @@ module Scan =
                 | Ok None ->
                     let stored = Db.getTranscript item.video_id
 
-                    if isNull (box stored) then [] else hitsFromText stems exclude stored.text
+                    if isNull (box stored) then [] else hits_from_text stems exclude stored.text
                 | Error(NoCaptions _) ->
                     counters.NoCaptions <- counters.NoCaptions + 1
                     []
@@ -267,12 +266,13 @@ module Scan =
             let childPriority = item.priority + float hits.Length
 
             for (id, _title) in related do
-                Db.enqueue topicName id (item.depth + 1) item.video_id "related" childPriority Settings.node
+                Db.enqueue topicName id (item.depth + 1) item.video_id "related" childPriority settings.node
 
             match transcript with
             | Error(Transient reason) ->
                 counters.Failed <- counters.Failed + 1
-                Db.markFrontierRetry topicName item.video_id item.attempts
+                let delay_seconds = item.attempts * item.attempts * settings.retryBaseSeconds
+                Db.markFrontierRetry topicName item.video_id item.attempts delay_seconds
                 Log.Warning("transient: {Video} depth {Depth} — {Reason}", item.video_id, item.depth, reason)
             | _ ->
                 Db.markExpanded topicName item.video_id
@@ -315,7 +315,6 @@ module Scan =
                 | Error _ -> return false
         }
 
-    // ------------------------------------------------------------ entry
 
     let run (options: ScanOptions) : Task<unit> =
         task {
@@ -329,7 +328,7 @@ module Scan =
             Log.Information(
                 "topic {Topic}, node {Node}, terms: {Stems}, exclude: {Exclude}",
                 topicName,
-                Settings.node,
+                settings.node,
                 String.concat ", " stems,
                 String.concat ", " exclude
             )
@@ -338,13 +337,13 @@ module Scan =
             Db.resetRunning topicName
 
             for videoId in options.SeedVideos do
-                Db.enqueue topicName videoId 0 null "seed" 0.0 Settings.node
+                Db.enqueue topicName videoId 0 null "seed" 0.0 settings.node
                 Log.Information("seed: {Video}", videoId)
 
             counters.Queued <- Db.queuedCount topicName
             Console.WriteLine(sprintf "topic: %s | queued: %d" options.Topic counters.Queued)
 
-            let exe = YtDlp.resolvePath Settings.ytDlpPath
+            let exe = YtDlp.resolvePath settings.ytDlpPath
             let mutable go = true
             let mutable idleRounds = 0
             let mutable consecutiveFailures = 0
@@ -364,7 +363,7 @@ module Scan =
                         counters.Current <- sprintf "backoff, %d queued" queued
                         render ()
                         heartbeat ()
-                        do! Http.delay 15000
+                        do! http.delay 15000
                     else
                         go <- false
                 else
@@ -380,40 +379,16 @@ module Scan =
                         consecutiveFailures <- consecutiveFailures + 1
 
                         if consecutiveFailures >= 3 then
-                            // Global rate limit: one video after another, with
-                            // the per-video backoff still queued. Either switch
-                            // exit IP (VPN) or pause the whole scanner.
-                            if Settings.vpnEnabled then
-                                counters.Current <- "rotating vpn"
-                                render ()
+                            
+                            counters.Current <- "cooling down 5 min"
+                            render ()
 
-                                let! rotated = Vpn.rotate ()
+                            Log.Warning(
+                                "rate limit: cooling down 5 min after {N} consecutive failures",
+                                consecutiveFailures
+                            )
 
-                                match rotated with
-                                | Ok name ->
-                                    Log.Warning(
-                                        "rate limit: {N} consecutive failures, switched to {Tunnel}",
-                                        consecutiveFailures,
-                                        name
-                                    )
-                                | Error reason ->
-                                    Log.Warning(
-                                        "rate limit: {N} consecutive failures, vpn rotation failed ({Reason}) — cooling down 5 min",
-                                        consecutiveFailures,
-                                        reason
-                                    )
-
-                                    do! Http.delay 300000
-                            else
-                                counters.Current <- "cooling down 5 min"
-                                render ()
-
-                                Log.Warning(
-                                    "rate limit: cooling down 5 min after {N} consecutive failures",
-                                    consecutiveFailures
-                                )
-
-                                do! Http.delay 300000
+                            do! http.delay 300000
 
                             consecutiveFailures <- 0
                     else
@@ -421,17 +396,16 @@ module Scan =
 
                     // Optional periodic rotation, independent of failures.
                     if
-                        Settings.vpnEnabled
-                        && Settings.vpnRotateEvery > 0
-                        && counters.Expanded % Settings.vpnRotateEvery = 0
+                        settings.vpnEnabled
+                        && settings.vpnRotateEvery > 0
+                        && counters.Expanded % settings.vpnRotateEvery = 0
                     then
                         counters.Current <- "rotating vpn"
                         render ()
-                        let! _ = Vpn.rotate ()
                         ()
 
                     // ±30% so the crawl does not look like a metronome
-                    do! Http.delayJitter options.DelayMs (options.DelayMs / 3)
+                    do! http.delayJitter options.DelayMs (options.DelayMs / 3)
 
             Console.WriteLine()
             heartbeat ()
